@@ -3,6 +3,10 @@ name = "rust_dns"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "dns-ligase"
+path = "src/main.rs"
+
 [dependencies]
 # async runtime: essential for high-performance networking
 tokio = { version = "1.36", features = ["full"] }
