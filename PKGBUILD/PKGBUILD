@@ -1,29 +1,36 @@
-# Maintainer: toff <toff@example.com>
-pkgname=rust-dns
-_pkgname=rust_dns
+# Maintainer: SirToffski <SirToffski@users.noreply.github.com>
+pkgname=dns-ligase
 pkgver=0.1.0
 pkgrel=1
 pkgdesc='DNS forwarder with blocklist support'
 arch=('x86_64')
-url='https://github.com/your-org/dns-ligase'
+url='https://github.com/SirToffski/dns-ligase'
 license=('MIT')
-depends=('rustls' 'openssl')
-makedepends=('cargo' 'rustc')
-source=("git+https://github.com/your-org/dns-ligase.git")
+depends=('gcc-libs' 'openssl')
+makedepends=('cargo')
+source=("$_pkgname::git+https://github.com/SirToffski/dns-ligase.git")
 sha256sums=('SKIP')
+backup=('etc/dns-ligase/config.toml')
+
+pkgver() {
+    cd "$srcdir/$_pkgname"
+    printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+prepare() {
+    cd "$srcdir/$_pkgname"
+    cargo fetch --frozen
+}
+
+build() {
+    cd "$srcdir/$_pkgname"
+    cargo build --release --frozen --bin dns-ligase
+}
 
 package() {
-    # Build
     cd "$srcdir/$_pkgname"
-    cargo install --path . --root "$pkgdir/usr"
-
-    # Systemd unit
+    install -Dm755 target/release/dns-ligase "$pkgdir/usr/bin/dns-ligase"
     install -Dm644 systemd/dns-ligase.service "$pkgdir/usr/lib/systemd/system/dns-ligase.service"
-
-    # Config file (drop-in to /etc)
     install -Dm644 config.toml "$pkgdir/etc/dns-ligase/config.toml"
-
-    # Create runtime dirs
     install -dm755 "$pkgdir/var/lib/dns-ligase"
-    install -dm755 "$pkgdir/etc/dns-ligase"
 }

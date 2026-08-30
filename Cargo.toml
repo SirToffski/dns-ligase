@@ -15,7 +15,7 @@ toml = "0.8"
 # serde: required for toml and general data mapping
 serde = { version = "1.0", features = ["derive"] }
 # HTTP/TLS: required for fetching blocklists
-reqwest = { version = "0.11", features = ["rustls-tls"] }
+reqwest = { version = "0.11", default-features = false, features = ["native-tls"] }
 # regex: required for blocklist rules and regex matching
 regex = "1.10"
 # logging: standard facade for journald
