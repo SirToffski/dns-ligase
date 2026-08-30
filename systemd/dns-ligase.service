@@ -1,0 +1,44 @@
+[Unit]
+Description=DNS Ligase - DNS forwarder with blocklist support
+Documentation=https://github.com/your-org/dns-ligase
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# Execution
+ExecStartPre=/usr/bin/test -f /etc/dns-ligase/config.toml
+ExecStart=/usr/local/bin/rust_dns --config /etc/dns-ligase/config.toml
+Restart=on-failure
+RestartSec=5
+
+# User / group (create with: useradd -r -s /usr/sbin/nologin dns-ligase)
+User=dns-ligase
+Group=dns-ligase
+
+# Working directory for relative paths (e.g. cache)
+WorkingDirectory=/var/lib/dns-ligase
+
+# Environment: HOME must point to cache dir so the default cache path resolves
+Environment=HOME=/var/lib/dns-ligase
+
+# Logging (journald)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dns-ligase
+
+# SIGHUP reload support
+ExecReload=/bin/kill -HUP $MAINPID
+
+# Security hardening
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/dns-ligase
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+
+[Install]
+WantedBy=multi-user.target

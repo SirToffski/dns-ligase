@@ -1,0 +1,29 @@
+# Maintainer: toff <toff@example.com>
+pkgname=rust-dns
+_pkgname=rust_dns
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='DNS forwarder with blocklist support'
+arch=('x86_64')
+url='https://github.com/your-org/dns-ligase'
+license=('MIT')
+depends=('rustls' 'openssl')
+makedepends=('cargo' 'rustc')
+source=("git+https://github.com/your-org/dns-ligase.git")
+sha256sums=('SKIP')
+
+package() {
+    # Build
+    cd "$srcdir/$_pkgname"
+    cargo install --path . --root "$pkgdir/usr"
+
+    # Systemd unit
+    install -Dm644 systemd/dns-ligase.service "$pkgdir/usr/lib/systemd/system/dns-ligase.service"
+
+    # Config file (drop-in to /etc)
+    install -Dm644 config.toml "$pkgdir/etc/dns-ligase/config.toml"
+
+    # Create runtime dirs
+    install -dm755 "$pkgdir/var/lib/dns-ligase"
+    install -dm755 "$pkgdir/etc/dns-ligase"
+}

@@ -45,7 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Ok(mut sigterm) = signal(SignalKind::terminate()) {
             sigterm.recv().await;
             log::info!("SIGTERM received, saving cache and shutting down...");
-            let c = cache_shutdown.lock().await;
+            let mut c = cache_shutdown.lock().await;
             if let Err(e) = c.save_to_disk(&cache_path_shutdown) {
                 log::error!("Failed to save cache: {}", e);
             }
@@ -116,9 +116,15 @@ async fn create_blocklist(config: &Config, cache: &Mutex<CachedLists>, cache_pat
         }
     }
 
-    // 3. Persist cache to disk after each reload (survives crashes/power loss)
-    if let Err(e) = cache.lock().await.save_to_disk(cache_path) {
-        log::error!("Failed to save cache: {}", e);
+    // 3. Prune stale entries and persist cache to disk
+    let urls = config.blocklists.urls.clone();
+    {
+        let mut c = cache.lock().await;
+        c.prune(&urls);
+        let save_result = c.save_to_disk(cache_path);
+        if let Err(e) = save_result {
+            log::error!("Failed to save cache: {}", e);
+        }
     }
 
     bl

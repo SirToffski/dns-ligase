@@ -181,6 +181,8 @@ pub struct CachedList {
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct CachedLists {
     pub map: HashMap<String, CachedList>,
+    #[serde(skip)]
+    dirty: bool,
 }
 
 impl CachedLists {
@@ -265,6 +267,7 @@ impl CachedLists {
                     fetched_at: now,
                     etag: new_etag,
                 });
+                self.dirty = true;
                 Ok(body)
             }
             _ => {
@@ -278,12 +281,22 @@ impl CachedLists {
         }
     }
 
-    /// Persist cache to disk.
-    pub fn save_to_disk(&self, path: &str) -> io::Result<()> {
+    /// Remove cache entries whose URLs are no longer in the config.
+    pub fn prune(&mut self, keep_urls: &[String]) {
+        let keep: std::collections::HashSet<&str> = keep_urls.iter().map(|s| s.as_str()).collect();
+        self.map.retain(|url, _| keep.contains(url.as_str()));
+    }
+
+    /// Persist cache to disk only if it has been modified since last save.
+    pub fn save_to_disk(&mut self, path: &str) -> io::Result<()> {
+        if !self.dirty {
+            return Ok(());
+        }
+        self.dirty = false;
         if let Some(parent) = Path::new(path).parent() {
             fs::create_dir_all(parent)?;
         }
-        let data = serde_json::to_string_pretty(self)?;
+        let data = serde_json::to_string(self)?;
         fs::write(path, data)?;
         Ok(())
     }

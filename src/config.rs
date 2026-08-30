@@ -1,6 +1,13 @@
 use serde::Deserialize;
 use std::net::Ipv4Addr;
 
+fn default_cache_path() -> String {
+    std::env::var("HOME")
+        .ok()
+        .map(|h| format!("{}/.cache/dns-ligase/cache.json", h))
+        .unwrap_or_else(|| "cache.json".to_string())
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub server: ServerConfig,
@@ -19,17 +26,13 @@ pub struct ServerConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CacheConfig {
-    #[serde(default)]
+    #[serde(default = "default_cache_path")]
     pub path: String,
 }
 
 impl Default for CacheConfig {
     fn default() -> Self {
-        let home = std::env::var("HOME").ok();
-        let path = home
-            .map(|h| format!("{}/.cache/dns-ligase/cache.json", h))
-            .unwrap_or_else(|| "cache.json".to_string());
-        Self { path }
+        Self { path: default_cache_path() }
     }
 }
 
