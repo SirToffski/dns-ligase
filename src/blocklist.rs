@@ -197,7 +197,8 @@ impl CachedLists {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         self.map.get(url).and_then(|c| {
-            if now - c.fetched_at < interval_secs {
+            // saturating_sub prevents panic on clock skew (NTP steps, copied cache)
+            if now.saturating_sub(c.fetched_at) < interval_secs {
                 Some(c.body.clone())
             } else {
                 None
@@ -226,7 +227,17 @@ impl CachedLists {
             request = request.header(reqwest::header::IF_NONE_MATCH, etag);
         }
 
-        let resp = request.send().await?;
+        let resp = match request.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                // Network failure — fall back to cached body if available
+                if let Some(cached) = self.map.get(url) {
+                    log::warn!("Fetch failed for {url} ({e}); using cached copy");
+                    return Ok(cached.body.clone());
+                }
+                return Err(e.into());
+            }
+        };
 
         match resp.status() {
             reqwest::StatusCode::NOT_MODIFIED => {
@@ -257,6 +268,11 @@ impl CachedLists {
                 Ok(body)
             }
             _ => {
+                // HTTP error (4xx/5xx) — fall back to cached body if available
+                if let Some(cached) = self.map.get(url) {
+                    log::warn!("Fetch returned {} for {}; using cached copy", resp.status(), url);
+                    return Ok(cached.body.clone());
+                }
                 Err(io::Error::new(io::ErrorKind::Other, format!("HTTP {}", resp.status())).into())
             }
         }

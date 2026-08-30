@@ -19,6 +19,7 @@ pub struct ServerConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CacheConfig {
+    #[serde(default)]
     pub path: String,
 }
 
@@ -44,6 +45,10 @@ pub struct UpstreamConfig {
 pub struct BlocklistConfig {
     pub urls: Vec<String>,
     pub refresh_interval_secs: u64,
+    /// How long to use a cached blocklist body before refetching.
+    /// Defaults to refresh_interval_secs if not set.
+    #[serde(default)]
+    pub cache_ttl_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -30,13 +30,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize Blocklist
     let cfg_init = config.read().await.clone();
-    let blocklist = Arc::new(RwLock::new(create_blocklist(&cfg_init, &cache).await));
+    let blocklist = Arc::new(RwLock::new(create_blocklist(&cfg_init, &cache, &cache_path).await));
 
     // Spawn refresh timer task
-    spawn_refresh_task(Arc::clone(&config), Arc::clone(&blocklist), Arc::clone(&cache));
+    spawn_refresh_task(Arc::clone(&config), Arc::clone(&blocklist), Arc::clone(&cache), cache_path.clone());
 
     // Spawn SIGHUP reload task
-    spawn_sighup_handler(Arc::clone(&config), Arc::clone(&blocklist), Arc::clone(&cache));
+    spawn_sighup_handler(Arc::clone(&config), Arc::clone(&blocklist), Arc::clone(&cache), cache_path.clone());
 
     // Spawn disk-persist task (save cache on graceful shutdown)
     let cache_shutdown = Arc::clone(&cache);
@@ -78,7 +78,7 @@ async fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
 }
 
 /// Create a Blocklist from config: manual rules + all blocklist URLs (cached or fresh).
-async fn create_blocklist(config: &Config, cache: &Mutex<CachedLists>) -> Blocklist {
+async fn create_blocklist(config: &Config, cache: &Mutex<CachedLists>, cache_path: &str) -> Blocklist {
     let mut bl = Blocklist::new();
 
     // 1. Apply manual rules
@@ -100,12 +100,12 @@ async fn create_blocklist(config: &Config, cache: &Mutex<CachedLists>) -> Blockl
     }
 
     // 2. Fetch each blocklist URL (cached or fresh), merge into final
-    let interval = config.blocklists.refresh_interval_secs;
+    let cache_ttl = config.blocklists.cache_ttl_secs.unwrap_or(config.blocklists.refresh_interval_secs);
     let urls = config.blocklists.urls.clone();
     for url in &urls {
         log::info!("Fetching blocklist: {}", url);
         let mut c = cache.lock().await;
-        match c.fetch_or_cached(url, interval).await {
+        match c.fetch_or_cached(url, cache_ttl).await {
             Ok(body) => {
                 log::info!("Blocklist fetched: {}", url);
                 parse_lines_into(&mut bl, &body);
@@ -116,6 +116,11 @@ async fn create_blocklist(config: &Config, cache: &Mutex<CachedLists>) -> Blockl
         }
     }
 
+    // 3. Persist cache to disk after each reload (survives crashes/power loss)
+    if let Err(e) = cache.lock().await.save_to_disk(cache_path) {
+        log::error!("Failed to save cache: {}", e);
+    }
+
     bl
 }
 
@@ -123,59 +128,28 @@ fn spawn_refresh_task(
     config: Arc<RwLock<Config>>,
     blocklist: Arc<RwLock<Blocklist>>,
     cache: Arc<Mutex<CachedLists>>,
+    cache_path: String,
 ) {
     tokio::spawn(async move {
         loop {
-            let (interval, urls, manual_block, manual_allow, regex_block, regex_allow) = {
+            let interval = {
                 let cfg = config.read().await;
-                (
-                    cfg.blocklists.refresh_interval_secs,
-                    cfg.blocklists.urls.clone(),
-                    cfg.matching.manual_block.clone(),
-                    cfg.matching.manual_allow.clone(),
-                    cfg.matching.regex_block.clone(),
-                    cfg.matching.regex_allow.clone(),
-                )
+                cfg.blocklists.refresh_interval_secs
             };
 
             tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
             log::info!("Refreshing blocklists...");
 
-            // Rebuild blocklist from scratch (same logic as create_blocklist)
-            let mut new_bl = Blocklist::new();
+            let cfg = {
+                let cfg = config.read().await;
+                cfg.clone()
+            };
 
-            for domain in &manual_block {
-                let _ = new_bl.parse_line(domain, crate::blocklist::ListFormat::AdBlock);
-            }
-            for domain in &manual_allow {
-                new_bl.allow_domains.insert(domain.to_lowercase().trim_end_matches('.').to_string());
-            }
-            for pattern in &regex_block {
-                if let Ok(re) = regex::Regex::new(pattern) {
-                    new_bl.block_regex.push(re);
-                }
-            }
-            for pattern in &regex_allow {
-                if let Ok(re) = regex::Regex::new(pattern) {
-                    new_bl.allow_regex.push(re);
-                }
-            }
-
-            for url in &urls {
-                let mut c = cache.lock().await;
-                match c.fetch_or_cached(url, interval).await {
-                    Ok(body) => {
-                        parse_lines_into(&mut new_bl, &body);
-                    }
-                    Err(e) => {
-                        log::warn!("Refresh fetch failed for {}: {}", url, e);
-                    }
-                }
-            }
+            let new_blocklist = create_blocklist(&cfg, &cache, &cache_path).await;
 
             {
                 let mut lock = blocklist.write().await;
-                *lock = new_bl;
+                *lock = new_blocklist;
                 log::info!("Blocklist refreshed successfully.");
             }
         }
@@ -186,6 +160,7 @@ fn spawn_sighup_handler(
     config: Arc<RwLock<Config>>,
     blocklist: Arc<RwLock<Blocklist>>,
     cache: Arc<Mutex<CachedLists>>,
+    cache_path: String,
 ) {
     tokio::spawn(async move {
         match signal(SignalKind::hangup()) {
@@ -304,7 +279,7 @@ fn spawn_sighup_handler(
                         let cfg = config.read().await;
                         cfg.clone()
                     };
-                    let new_blocklist = create_blocklist(&cfg_reload, &cache).await;
+                    let new_blocklist = create_blocklist(&cfg_reload, &cache, &cache_path).await;
                     *blocklist.write().await = new_blocklist;
                     log::info!("Configuration reloaded successfully.");
                 }
