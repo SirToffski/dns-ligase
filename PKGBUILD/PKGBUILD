@@ -32,5 +32,4 @@ package() {
     install -Dm755 target/release/dns-ligase "$pkgdir/usr/bin/dns-ligase"
     install -Dm644 systemd/dns-ligase.service "$pkgdir/usr/lib/systemd/system/dns-ligase.service"
     install -Dm644 config.toml "$pkgdir/etc/dns-ligase/config.toml"
-    install -dm755 "$pkgdir/var/lib/dns-ligase"
 }
