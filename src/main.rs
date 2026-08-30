@@ -49,6 +49,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Err(e) = c.save_to_disk(&cache_path_shutdown) {
                 log::error!("Failed to save cache: {}", e);
             }
+            log::info!("Cache saved, exiting.");
+            std::process::exit(0);
         }
     });
 
@@ -72,7 +74,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
-    let config_str = std::fs::read_to_string("config.toml")?;
+    let args: Vec<String> = std::env::args().collect();
+    let path = (|| {
+        for i in 0..args.len() {
+            if args[i] == "--config" {
+                if i + 1 < args.len() {
+                    return Some(args[i + 1].clone());
+                }
+            }
+        }
+        None
+    })()
+    .or_else(|| std::env::var("DNS_LIGASE_CONFIG").ok())
+    .unwrap_or_else(|| "config.toml".to_string());
+    let config_str = std::fs::read_to_string(&path)?;
     let config: Config = toml::from_str(&config_str)?;
     Ok(config)
 }

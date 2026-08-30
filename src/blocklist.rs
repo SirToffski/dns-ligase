@@ -284,7 +284,11 @@ impl CachedLists {
     /// Remove cache entries whose URLs are no longer in the config.
     pub fn prune(&mut self, keep_urls: &[String]) {
         let keep: std::collections::HashSet<&str> = keep_urls.iter().map(|s| s.as_str()).collect();
+        let before = self.map.len();
         self.map.retain(|url, _| keep.contains(url.as_str()));
+        if self.map.len() < before {
+            self.dirty = true;
+        }
     }
 
     /// Persist cache to disk only if it has been modified since last save.
