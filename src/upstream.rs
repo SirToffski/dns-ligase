@@ -3,6 +3,7 @@ use std::sync::Arc;
 use tokio::net::{UdpSocket, TcpListener, TcpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::blocklist::Blocklist;
+use crate::config::Config;
 use crate::dns::DnsMessage;
 use tokio::sync::RwLock;
 use tokio::time::{timeout, Duration};
@@ -10,17 +11,17 @@ use tokio::time::{timeout, Duration};
 pub struct UdpForwarder {
     udp_socket: Arc<UdpSocket>,
     listen_addr: String,
-    upstream_addr: std::net::SocketAddr,
+    config: Arc<RwLock<Config>>,
     blocklist: Arc<RwLock<Blocklist>>,
 }
 
 impl UdpForwarder {
-    pub async fn new(listen_addr: &str, upstream_addr: std::net::SocketAddr, blocklist: Arc<RwLock<Blocklist>>) -> io::Result<Self> {
+    pub async fn new(listen_addr: &str, config: Arc<RwLock<Config>>, blocklist: Arc<RwLock<Blocklist>>) -> io::Result<Self> {
         let socket = UdpSocket::bind(listen_addr).await?;
         Ok(Self {
             udp_socket: Arc::new(socket),
             listen_addr: listen_addr.to_string(),
-            upstream_addr,
+            config,
             blocklist,
         })
     }
@@ -30,7 +31,7 @@ impl UdpForwarder {
 
         // UDP Task
         let udp_socket = Arc::clone(&self.udp_socket);
-        let upstream_udp = self.upstream_addr;
+        let config_udp = Arc::clone(&self.config);
         let blocklist_udp = Arc::clone(&self.blocklist);
 
         tasks.push(tokio::spawn(async move {
@@ -39,11 +40,11 @@ impl UdpForwarder {
                 match udp_socket.recv_from(&mut buf).await {
                     Ok((len, addr)) => {
                         let packet = buf[..len].to_vec();
+                        let config_ref = Arc::clone(&config_udp);
                         let blocklist_ref = Arc::clone(&blocklist_udp);
-                        let upstream_ref = upstream_udp;
                         let socket_ref = Arc::clone(&udp_socket);
                         tokio::spawn(async move {
-                            if let Err(e) = Self::handle_udp_query(socket_ref, upstream_ref, addr, packet, blocklist_ref).await {
+                            if let Err(e) = Self::handle_udp_query(socket_ref, config_ref, addr, packet, blocklist_ref).await {
                                 log::error!("UDP query error: {}", e);
                             }
                         });
@@ -58,16 +59,16 @@ impl UdpForwarder {
 
         // TCP Task
         let listen_addr_tcp = self.listen_addr.clone();
-        let upstream_tcp = self.upstream_addr;
+        let config_tcp = Arc::clone(&self.config);
         let blocklist_tcp = Arc::clone(&self.blocklist);
         tasks.push(tokio::spawn(async move {
             let listener = TcpListener::bind(&listen_addr_tcp).await.unwrap();
             loop {
                 if let Ok((mut stream, addr)) = listener.accept().await {
-                    let upstream_ref = upstream_tcp;
+                    let config_ref = Arc::clone(&config_tcp);
                     let blocklist_ref = Arc::clone(&blocklist_tcp);
                     tokio::spawn(async move {
-                        if let Err(e) = Self::handle_tcp_query(&mut stream, upstream_ref, addr, blocklist_ref).await {
+                        if let Err(e) = Self::handle_tcp_query(&mut stream, config_ref, addr, blocklist_ref).await {
                             log::error!("TCP query error: {}", e);
                         }
                     });
@@ -84,7 +85,7 @@ impl UdpForwarder {
 
     async fn handle_udp_query(
         socket: Arc<UdpSocket>,
-        upstream: std::net::SocketAddr,
+        config: Arc<RwLock<Config>>,
         client: std::net::SocketAddr,
         packet: Vec<u8>,
         blocklist: Arc<RwLock<Blocklist>>
@@ -137,6 +138,14 @@ impl UdpForwarder {
             msg_to_send.serialize()?
         };
 
+        // Read upstream address from config (dynamic — picks up SIGHUP changes)
+        let upstream: std::net::SocketAddr = {
+            let cfg = config.read().await;
+            format!("{}:{}", cfg.upstream.address, cfg.upstream.port)
+                .parse()
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("bad upstream: {e}")))?
+        };
+
         let upstream_socket = UdpSocket::bind("0.0.0.0:0").await?;
         upstream_socket.send_to(&packet_to_send, upstream).await?;
 
@@ -151,7 +160,7 @@ impl UdpForwarder {
 
     async fn handle_tcp_query(
         client_stream: &mut TcpStream,
-        upstream: std::net::SocketAddr,
+        config: Arc<RwLock<Config>>,
         _client_addr: std::net::SocketAddr,
         blocklist: Arc<RwLock<Blocklist>>
     ) -> io::Result<()> {
@@ -208,6 +217,14 @@ impl UdpForwarder {
             msg_to_send.additionals.clear();
             msg_to_send.add_opt_record(advertised_size as u16);
             msg_to_send.serialize()?
+        };
+
+        // Read upstream address from config (dynamic — picks up SIGHUP changes)
+        let upstream: std::net::SocketAddr = {
+            let cfg = config.read().await;
+            format!("{}:{}", cfg.upstream.address, cfg.upstream.port)
+                .parse()
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("bad upstream: {e}")))?
         };
 
         let mut upstream_stream = timeout(Duration::from_secs(2), TcpStream::connect(upstream)).await

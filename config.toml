@@ -3,12 +3,12 @@ listen_addr = "127.0.0.1"
 listen_port = 5354
 
 [upstream]
-address = "8.8.8.8"
-port = 53
+address = "192.168.2.53"
+port = 5354
 use_tcp = false
 
 [blocklists]
-urls = ["https://adguardteam.github.io/AdGuardSDNSFilter/Filters/filter.txt"]
+urls = ["https://adguardteam.github.io/AdGuardSDNSFilter/Filters/filter.txt", "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts", "https://v.firebog.net/hosts/Prigent-Crypto.txt"]
 refresh_interval_secs = 3600
 
 [matching]

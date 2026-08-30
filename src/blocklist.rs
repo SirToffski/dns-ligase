@@ -1,6 +1,12 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
+use std::fs;
+use std::io;
+use std::path::Path;
+use std::time::SystemTime;
+
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Default)]
 pub struct Blocklist {
@@ -8,15 +14,6 @@ pub struct Blocklist {
     pub block_domains: HashSet<String>,
     pub allow_regex: Vec<Regex>,
     pub block_regex: Vec<Regex>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
-pub enum ListFormat {
-    Hosts,
-    AdBlock,
-    PiHole,
-    AdGuard,
 }
 
 impl Blocklist {
@@ -98,6 +95,7 @@ impl Blocklist {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn fetch_and_parse(&mut self, url: &str, format: Option<ListFormat>) -> Result<(), Box<dyn Error>> {
         let content = reqwest::get(url).await?.text().await?;
         for line in content.lines() {
@@ -133,11 +131,11 @@ impl Blocklist {
     pub fn matches(&self, domain: &str) -> bool {
         let domain_lower = domain.to_lowercase();
         if self.allow_domains.contains(&domain_lower) {
-            return false; 
+            return false;
         }
         for re in &self.allow_regex {
             if re.is_match(&domain_lower) {
-                return false; 
+                return false;
             }
         }
         if self.block_domains.contains(&domain_lower) {
@@ -150,6 +148,145 @@ impl Blocklist {
         }
         false
     }
+}
+
+/// Parse lines from a blocklist body into an existing Blocklist.
+/// This is used by the cache reload path to merge a single URL's content.
+pub fn parse_lines_into(bl: &mut Blocklist, body: &str) {
+    for line in body.lines() {
+        let _ = bl.parse_auto(line);
+    }
+}
+
+/// Merge source blocklist into target.
+#[allow(dead_code)]
+pub fn merge_blocklist(target: &mut Blocklist, source: Blocklist) {
+    target.allow_domains.extend(source.allow_domains);
+    target.block_domains.extend(source.block_domains);
+    target.allow_regex.extend(source.allow_regex);
+    target.block_regex.extend(source.block_regex);
+}
+
+// ---------------------------------------------------------------------------
+// CachedLists: raw-body cache with freshness and disk persistence
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CachedList {
+    pub body: String,
+    pub fetched_at: u64,  // Unix timestamp (seconds)
+    pub etag: Option<String>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct CachedLists {
+    pub map: HashMap<String, CachedList>,
+}
+
+impl CachedLists {
+    #[allow(dead_code)]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Get cached body if it was fetched within the interval.
+    #[allow(dead_code)]
+    pub fn get_if_fresh(&self, url: &str, interval_secs: u64) -> Option<String> {
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.map.get(url).and_then(|c| {
+            if now - c.fetched_at < interval_secs {
+                Some(c.body.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Fetch a URL. If cached and fresh, return cached body.
+    /// Otherwise fetch fresh; on failure, return cached body if available.
+    pub async fn fetch_or_cached(
+        &mut self,
+        url: &str,
+        interval_secs: u64,
+    ) -> Result<String, Box<dyn Error>> {
+        // Check cache freshness
+        if let Some(body) = self.get_if_fresh(url, interval_secs) {
+            return Ok(body);
+        }
+
+        // Try to fetch fresh
+        let client = reqwest::Client::new();
+        let mut request = client.get(url);
+
+        // Conditional GET: send If-None-Match if we have an etag
+        if let Some(ref etag) = self.map.get(url).and_then(|c| c.etag.clone()) {
+            request = request.header(reqwest::header::IF_NONE_MATCH, etag);
+        }
+
+        let resp = request.send().await?;
+
+        match resp.status() {
+            reqwest::StatusCode::NOT_MODIFIED => {
+                // Not modified — keep existing cache entry, return cached body
+                if let Some(cached) = self.map.get(url) {
+                    return Ok(cached.body.clone());
+                }
+                return Err(io::Error::new(io::ErrorKind::Other, "304 but no cached body").into());
+            }
+            reqwest::StatusCode::OK => {
+                let new_etag = resp
+                    .headers()
+                    .get(reqwest::header::ETAG)
+                    .and_then(|h| h.to_str().ok())
+                    .map(|s| s.to_string());
+                let body = resp.text().await?;
+
+                let now = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+
+                self.map.insert(url.to_string(), CachedList {
+                    body: body.clone(),
+                    fetched_at: now,
+                    etag: new_etag,
+                });
+                Ok(body)
+            }
+            _ => {
+                Err(io::Error::new(io::ErrorKind::Other, format!("HTTP {}", resp.status())).into())
+            }
+        }
+    }
+
+    /// Persist cache to disk.
+    pub fn save_to_disk(&self, path: &str) -> io::Result<()> {
+        if let Some(parent) = Path::new(path).parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let data = serde_json::to_string_pretty(self)?;
+        fs::write(path, data)?;
+        Ok(())
+    }
+
+    /// Load cache from disk. Returns default if file doesn't exist or is invalid.
+    pub fn load_from_disk(path: &str) -> io::Result<Self> {
+        let data = fs::read_to_string(path)?;
+        let cache: CachedLists = serde_json::from_str(&data)?;
+        Ok(cache)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum ListFormat {
+    Hosts,
+    AdBlock,
+    PiHole,
+    AdGuard,
 }
 
 #[cfg(test)]
@@ -172,7 +309,7 @@ mod tests {
     fn test_adblock_format() {
         let mut bl = Blocklist::new();
         bl.parse_line("||ads.com^", ListFormat::AdBlock).unwrap();
-        bl.parse_line("/track\\.me/", ListFormat::AdBlock).unwrap(); 
+        bl.parse_line("/track\\.me/", ListFormat::AdBlock).unwrap();
         assert!(bl.matches("ads.com"));
         assert!(bl.matches("sub.ads.com"));
         assert!(bl.matches("track.me"));
@@ -193,7 +330,7 @@ mod tests {
     fn test_regex_allow() {
         let mut bl = Blocklist::new();
         bl.parse_line("||ads.com^", ListFormat::AdBlock).unwrap();
-        bl.parse_line("/^safe\\.com$/", ListFormat::AdBlock).unwrap(); 
+        bl.parse_line("/^safe\\.com$/", ListFormat::AdBlock).unwrap();
         bl.parse_line("@@/^safe\\.com$/", ListFormat::AdBlock).unwrap();
         assert!(bl.matches("ads.com"));
         assert!(!bl.matches("safe.com"));
@@ -219,7 +356,7 @@ mod tests {
         let mut bl = Blocklist::new();
         bl.parse_auto("||ads.com^").unwrap();
         assert!(bl.matches("sub.ads.com"));
-        
+
         let mut bl2 = Blocklist::new();
         bl2.parse_auto("example.com").unwrap();
         assert!(bl2.matches("example.com"));
@@ -238,5 +375,16 @@ mod tests {
             bl.parse_line("example.com", format).unwrap();
             assert!(bl.matches("example.com"), "Failed for {:?}", format);
         }
+    }
+
+    #[test]
+    fn test_adguard_format() {
+        let mut bl = Blocklist::new();
+        bl.parse_line("||ads.example.com^", ListFormat::AdGuard).unwrap();
+        bl.parse_line("/track\\.me/", ListFormat::AdGuard).unwrap();
+        assert!(bl.matches("ads.example.com"));
+        assert!(bl.matches("sub.ads.example.com"));
+        assert!(bl.matches("track.me"));
+        assert!(!bl.matches("google.com"));
     }
 }
