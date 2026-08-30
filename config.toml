@@ -1,0 +1,18 @@
+[server]
+listen_addr = "127.0.0.1"
+listen_port = 5354
+
+[upstream]
+address = "8.8.8.8"
+port = 53
+use_tcp = false
+
+[blocklists]
+urls = ["https://adguardteam.github.io/AdGuardSDNSFilter/Filters/filter.txt"]
+refresh_interval_secs = 3600
+
+[matching]
+manual_block = ["ads.example.com"]
+manual_allow = []
+regex_block = ["^(.+[_.-])?telemetry[_.-]"]
+regex_allow = []
