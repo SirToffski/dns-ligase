@@ -9,7 +9,7 @@ Type=simple
 
 # Execution
 ExecStartPre=/usr/bin/test -f /etc/dns-ligase/config.toml
-ExecStart=/usr/local/bin/rust_dns --config /etc/dns-ligase/config.toml
+ExecStart=/usr/bin/dns-ligase --config /etc/dns-ligase/config.toml
 Restart=on-failure
 RestartSec=5
 
