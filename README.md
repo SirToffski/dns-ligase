@@ -1,4 +1,4 @@
-# rust_dns
+# dns-ligase
 
 A small DNS filtering forwarder written in Rust. It listens for DNS queries on UDP and TCP, checks the requested domain against blocklists and allowlists, returns `NXDOMAIN` for anything blocked, and forwards everything else to an upstream resolver.
 
