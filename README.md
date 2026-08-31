@@ -220,4 +220,4 @@ MIT.
 
 ---
 
-*Built as a learning project, largely by pair-programming with local LLMs (Gemma 4 26B and Qwen 3.5 35B on llama.cpp) inside agentic harnesses. Nearly every bug found along the way was of the same kind: code that logged what it intended rather than what it did. Verify against `dig`, not against the log line.*
+*Built as a learning project, largely by pair-programming with local LLMs (Gemma 4 26B and Qwen 3.6 35B on llama.cpp) inside agentic harnesses. Nearly every bug found along the way was of the same kind: code that logged what it intended rather than what it did. Verify against `dig`, not against the log line.*
