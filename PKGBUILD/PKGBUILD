@@ -1,7 +1,7 @@
 # Maintainer: SirToffski <SirToffski@users.noreply.github.com>
 pkgname=dns-ligase-git
 _pkgname=dns-ligase
-pkgver=0.1.0
+pkgver=r12.9ed75b4
 pkgrel=1
 pkgdesc='DNS forwarder with blocklist support'
 arch=('x86_64')

@@ -18,6 +18,11 @@ StateDirectory=dns-ligase
 WorkingDirectory=/var/lib/dns-ligase
 Environment=HOME=/var/lib/dns-ligase
 
+# Resource limits
+MemoryMax=512M
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
 # Logging (journald)
 StandardOutput=journal
 StandardError=journal

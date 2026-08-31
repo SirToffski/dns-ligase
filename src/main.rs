@@ -123,6 +123,12 @@ async fn create_blocklist(config: &Config, cache: &Mutex<CachedLists>, cache_pat
         }
     }
 
+    log::info!(
+        "Blocklist: {} block domains, {} block regex, {} allow domains, {} allow regex",
+        bl.block_domains.len(), bl.block_regex.len(),
+        bl.allow_domains.len(), bl.allow_regex.len()
+    );
+
     // 3. Prune stale entries and persist cache to disk
     let urls = config.blocklists.urls.clone();
     {

@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 pub struct Blocklist {
     pub allow_domains: HashSet<String>,
     pub block_domains: HashSet<String>,
+    pub allow_suffixes: HashSet<String>,
+    pub block_suffixes: HashSet<String>,
     pub allow_regex: Vec<Regex>,
     pub block_regex: Vec<Regex>,
 }
@@ -25,6 +27,8 @@ impl Blocklist {
     pub fn clear(&mut self) {
         self.allow_domains.clear();
         self.block_domains.clear();
+        self.allow_suffixes.clear();
+        self.block_suffixes.clear();
         self.allow_regex.clear();
         self.block_regex.clear();
     }
@@ -50,14 +54,18 @@ impl Blocklist {
                 };
 
                 if pattern_part.starts_with("||") {
-                    let pattern = pattern_part.trim_start_matches("||").trim_end_matches('^');
-                    let escaped = regex::escape(pattern);
-                    let re_str = format!(r"^(?:.*\.)?{}", escaped);
-                    let re = Regex::new(&re_str)?;
+                    let domain = pattern_part
+                        .trim_start_matches("||")
+                        .trim_end_matches('^')
+                        .trim_end_matches('.')
+                        .to_lowercase();
+                    if domain.is_empty() {
+                        return Ok(());
+                    }
                     if is_allow {
-                        self.allow_regex.push(re);
+                        self.allow_suffixes.insert(domain);
                     } else {
-                        self.block_regex.push(re);
+                        self.block_suffixes.insert(domain);
                     }
                 } else if pattern_part.starts_with('/') && pattern_part.ends_with('/') {
                     let pattern = &pattern_part[1..pattern_part.len() - 1];
@@ -107,6 +115,20 @@ impl Blocklist {
         Ok(())
     }
 
+    fn suffix_match(set: &HashSet<String>, domain: &str) -> bool {
+        if set.contains(domain) {
+            return true;
+        }
+        let mut rest = domain;
+        while let Some(pos) = rest.find('.') {
+            rest = &rest[pos + 1..];
+            if set.contains(rest) {
+                return true;
+            }
+        }
+        false
+    }
+
     fn clean_domain_static(domain: &str) -> Option<String> {
         let domain = domain.split('#').next()?.trim();
         if domain.is_empty() {
@@ -130,6 +152,7 @@ impl Blocklist {
 
     pub fn matches(&self, domain: &str) -> bool {
         let domain_lower = domain.to_lowercase();
+        // Allow takes precedence over block
         if self.allow_domains.contains(&domain_lower) {
             return false;
         }
@@ -138,7 +161,13 @@ impl Blocklist {
                 return false;
             }
         }
+        if Self::suffix_match(&self.allow_suffixes, &domain_lower) {
+            return false;
+        }
         if self.block_domains.contains(&domain_lower) {
+            return true;
+        }
+        if Self::suffix_match(&self.block_suffixes, &domain_lower) {
             return true;
         }
         for re in &self.block_regex {
@@ -163,6 +192,8 @@ pub fn parse_lines_into(bl: &mut Blocklist, body: &str) {
 pub fn merge_blocklist(target: &mut Blocklist, source: Blocklist) {
     target.allow_domains.extend(source.allow_domains);
     target.block_domains.extend(source.block_domains);
+    target.allow_suffixes.extend(source.allow_suffixes);
+    target.block_suffixes.extend(source.block_suffixes);
     target.allow_regex.extend(source.allow_regex);
     target.block_regex.extend(source.block_regex);
 }
@@ -419,5 +450,34 @@ mod tests {
         assert!(bl.matches("sub.ads.example.com"));
         assert!(bl.matches("track.me"));
         assert!(!bl.matches("google.com"));
+    }
+
+    #[test]
+    fn test_suffix_match_blocks_subdomains() {
+        let mut bl = Blocklist::new();
+        bl.parse_line("||ads.com^", ListFormat::AdBlock).unwrap();
+        assert!(bl.matches("ads.com"));
+        assert!(bl.matches("sub.ads.com"));
+        assert!(bl.matches("a.b.ads.com"));
+        assert!(!bl.matches("google.com"));
+    }
+
+    #[test]
+    fn test_suffix_match_no_anchor() {
+        let mut bl = Blocklist::new();
+        bl.parse_line("||ads.com^", ListFormat::AdBlock).unwrap();
+        // ads.com.evil.net should NOT be blocked (no implicit $ anchor)
+        assert!(!bl.matches("ads.com.evil.net"));
+        assert!(!bl.matches("notads.com"));
+    }
+
+    #[test]
+    fn test_allow_suffix_beats_block_suffix() {
+        let mut bl = Blocklist::new();
+        bl.parse_line("||ads.com^", ListFormat::AdBlock).unwrap();
+        bl.parse_line("@@||safe.ads.com^", ListFormat::AdBlock).unwrap();
+        assert!(bl.matches("ads.com"));
+        assert!(bl.matches("evil.ads.com"));
+        assert!(!bl.matches("safe.ads.com"));
     }
 }
