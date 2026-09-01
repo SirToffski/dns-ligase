@@ -3,6 +3,8 @@ Description=DNS Ligase - DNS forwarder with blocklist support
 Documentation=https://github.com/SirToffski/dns-ligase
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -18,10 +20,12 @@ StateDirectory=dns-ligase
 WorkingDirectory=/var/lib/dns-ligase
 Environment=HOME=/var/lib/dns-ligase
 
+# If you need to listen on 53
+# AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW
+# CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW
+
 # Resource limits
 MemoryMax=512M
-StartLimitIntervalSec=60
-StartLimitBurst=5
 
 # Logging (journald)
 StandardOutput=journal
