@@ -16,8 +16,14 @@
 
 use std::io;
 use std::os::unix::net::UnixDatagram;
+use std::sync::OnceLock;
 
 const JOURNAL_SOCKET: &str = "/run/systemd/journal/socket";
+
+/// Lazily-initialized, reused journald socket. Created once on first query
+/// log; if the socket can't be created (no journald), stores `None` and never
+/// retries, so the hot path is a single `send()` per log line.
+static JOURNAL_SOCK: OnceLock<Option<UnixDatagram>> = OnceLock::new();
 
 /// Log a DNS query decision to journald with structured fields.
 ///
@@ -60,10 +66,15 @@ pub fn log_query(
 }
 
 fn send(entry: &str) -> io::Result<()> {
-    let socket = UnixDatagram::unbound()?;
-    socket.connect(JOURNAL_SOCKET)?;
-    socket.send(entry.as_bytes())?;
-    Ok(())
+    let socket = JOURNAL_SOCK.get_or_init(|| {
+        UnixDatagram::unbound()
+            .and_then(|s| s.connect(JOURNAL_SOCKET).map(|_| s))
+            .ok()
+    });
+    match socket {
+        Some(s) => s.send(entry.as_bytes()).map(|_| ()),
+        None => Ok(()),
+    }
 }
 
 #[cfg(test)]

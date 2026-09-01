@@ -66,6 +66,16 @@ impl Upstream {
             }
         };
         socket.send(query).await?;
+
+        // The query ID is the first 2 bytes. Validate the response ID matches
+        // before accepting — a stale datagram from a previous query on a pooled
+        // socket would otherwise be returned as the answer to this query.
+        let query_id = if query.len() >= 2 {
+            u16::from_be_bytes([query[0], query[1]])
+        } else {
+            0
+        };
+
         let mut buf = vec![0u8; EDNS_BUFFER_SIZE];
         let len = match timeout(UPSTREAM_TIMEOUT, socket.recv(&mut buf)).await {
             Ok(Ok(len)) => len,
@@ -77,6 +87,21 @@ impl Upstream {
                 ))
             }
         };
+
+        // ID mismatch: a stale datagram was queued on this socket. Discard the
+        // socket (don't pool it) and return an error so the client retries.
+        let resp_id = if len >= 2 {
+            u16::from_be_bytes([buf[0], buf[1]])
+        } else {
+            0
+        };
+        if resp_id != query_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Upstream UDP response ID mismatch — stale datagram discarded",
+            ));
+        }
+
         // Success: return the socket if there is room, else let it drop.
         let mut pool = self.udp_pool.lock().await;
         if pool.len() < UDP_POOL_CAP {
@@ -365,78 +390,81 @@ impl UdpForwarder {
         blocklist: Arc<RwLock<Blocklist>>,
         log_queries: Arc<RwLock<bool>>,
     ) -> io::Result<()> {
-        let mut len_buf = [0u8; 2];
-        timeout(UPSTREAM_TIMEOUT, client_stream.read_exact(&mut len_buf))
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Client read timeout"))??;
-        let len = u16::from_be_bytes(len_buf) as usize;
+        // RFC 7766: a client may send multiple queries on one TCP connection.
+        // Loop until the client closes the connection or a timeout/error.
+        loop {
+            let mut len_buf = [0u8; 2];
+            timeout(UPSTREAM_TIMEOUT, client_stream.read_exact(&mut len_buf))
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Client read timeout"))??;
+            let len = u16::from_be_bytes(len_buf) as usize;
 
-        let mut packet = vec![0u8; len];
-        timeout(UPSTREAM_TIMEOUT, client_stream.read_exact(&mut packet))
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Client read timeout"))??;
+            let mut packet = vec![0u8; len];
+            timeout(UPSTREAM_TIMEOUT, client_stream.read_exact(&mut packet))
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Client read timeout"))??;
 
-        let msg = match DnsMessage::parse(&packet[..]) {
-            Ok(m) => m,
-            Err(e) => return Err(e),
-        };
+            let msg = match DnsMessage::parse(&packet[..]) {
+                Ok(m) => m,
+                Err(e) => return Err(e),
+            };
 
-        if let Some(q) = msg.questions.first() {
-            let outcome = blocklist.read().await.check(&q.name);
-            match outcome {
-                MatchOutcome::Blocked(rule) => {
-                    let response = build_nxdomain(&msg)?;
-                    write_tcp_message(client_stream, &response).await?;
-                    if *log_queries.read().await {
-                        journald::log_query(
-                            &client_addr.ip().to_string(),
-                            &q.name,
-                            qtype_str(q.qtype),
-                            "blocked",
-                            &rule,
-                        );
-                    }
-                    return Ok(());
-                }
-                MatchOutcome::Allowed(rule) => {
-                    if *log_queries.read().await {
-                        journald::log_query(
-                            &client_addr.ip().to_string(),
-                            &q.name,
-                            qtype_str(q.qtype),
-                            "allowed",
-                            &rule,
-                        );
-                    }
-                }
-                MatchOutcome::Forwarded => {}
-            }
-        }
-
-        let packet_to_send = {
-            let mut msg_to_send = msg.clone();
-            msg_to_send.edns_do = true;
-            msg_to_send.add_opt_record(EDNS_BUFFER_SIZE as u16);
-            msg_to_send.serialize()?
-        };
-
-        let upstream = upstream.read().await.clone();
-        let resp = upstream.tcp_query(&packet_to_send).await?;
-
-        write_tcp_message(client_stream, &resp).await?;
-
-        if *log_queries.read().await {
             if let Some(q) = msg.questions.first() {
-                journald::log_query(
-                    &client_addr.ip().to_string(),
-                    &q.name,
-                    qtype_str(q.qtype),
-                    "forwarded",
-                    "",
-                );
+                let outcome = blocklist.read().await.check(&q.name);
+                match outcome {
+                    MatchOutcome::Blocked(rule) => {
+                        let response = build_nxdomain(&msg)?;
+                        write_tcp_message(client_stream, &response).await?;
+                        if *log_queries.read().await {
+                            journald::log_query(
+                                &client_addr.ip().to_string(),
+                                &q.name,
+                                qtype_str(q.qtype),
+                                "blocked",
+                                &rule,
+                            );
+                        }
+                        continue;
+                    }
+                    MatchOutcome::Allowed(rule) => {
+                        if *log_queries.read().await {
+                            journald::log_query(
+                                &client_addr.ip().to_string(),
+                                &q.name,
+                                qtype_str(q.qtype),
+                                "allowed",
+                                &rule,
+                            );
+                        }
+                    }
+                    MatchOutcome::Forwarded => {}
+                }
+            }
+
+            let packet_to_send = {
+                let mut msg_to_send = msg.clone();
+                msg_to_send.edns_do = true;
+                msg_to_send.add_opt_record(EDNS_BUFFER_SIZE as u16);
+                msg_to_send.serialize()?
+            };
+
+            let upstream = upstream.read().await.clone();
+            let resp = upstream.tcp_query(&packet_to_send).await?;
+
+            write_tcp_message(client_stream, &resp).await?;
+
+            if *log_queries.read().await {
+                if let Some(q) = msg.questions.first() {
+                    journald::log_query(
+                        &client_addr.ip().to_string(),
+                        &q.name,
+                        qtype_str(q.qtype),
+                        "forwarded",
+                        "",
+                    );
+                }
             }
         }
-        Ok(())
     }
 }
 
@@ -471,7 +499,7 @@ fn build_nxdomain(msg: &DnsMessage) -> io::Result<Vec<u8>> {
     response_msg.header.qdcount = 1;
     response_msg.header.ancount = 0;
     response_msg.header.nscount = 0;
-    response_msg.header.arcount = 0;
+    // arcount is set by serialize() from additionals.len(), not the header field.
     response_msg.answers.clear();
     response_msg.authorities.clear();
     response_msg.additionals.clear();

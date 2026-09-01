@@ -119,20 +119,17 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
 
 /// Filter entries according to the given flags.
 pub fn filter_entries(entries: Vec<QueryEntry>, f: &StatsFilter) -> Vec<QueryEntry> {
+    let any_action = f.blocked || f.allowed || f.forwarded;
     entries
         .into_iter()
         .filter(|e| {
-            if f.blocked && e.action != "blocked" {
-                return false;
-            }
-            if f.allowed && e.action != "allowed" {
-                return false;
-            }
-            if f.forwarded && e.action != "forwarded" {
-                return false;
-            }
-            if !f.blocked && !f.allowed && !f.forwarded {
-                // No action filter: show all.
+            if any_action {
+                let action_match = (f.blocked && e.action == "blocked")
+                    || (f.allowed && e.action == "allowed")
+                    || (f.forwarded && e.action == "forwarded");
+                if !action_match {
+                    return false;
+                }
             }
             if let Some(ref d) = f.domain {
                 if !e.domain.contains(d) {
@@ -213,6 +210,7 @@ pub fn run_stats(filter: StatsFilter) -> Result<(), Box<dyn std::error::Error>> 
     let mut cmd = Command::new("journalctl");
     cmd.arg("-u").arg("dns-ligase");
     cmd.arg("--output=json");
+    cmd.arg("--no-pager");
     if let Some(ref since) = filter.since {
         cmd.arg("--since").arg(since);
     }
