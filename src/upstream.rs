@@ -18,6 +18,10 @@ const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(2);
 /// IP fragmentation. We advertise this fixed size regardless of what the client
 /// asked for; the client's own limit is honored separately via truncation.
 const EDNS_BUFFER_SIZE: usize = 1232;
+/// How long to wait for a client to send the next query on an idle TCP
+/// connection (RFC 7766 idle timeout). A clean EOF or expiry here closes the
+/// connection normally — not an error.
+const CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Max idle sockets kept per transport. On exhaustion a fresh connection is
 /// created rather than blocking, so a burst never stalls.
 const UDP_POOL_CAP: usize = 16;
@@ -391,14 +395,21 @@ impl UdpForwarder {
         log_queries: Arc<RwLock<bool>>,
     ) -> io::Result<()> {
         // RFC 7766: a client may send multiple queries on one TCP connection.
-        // Loop until the client closes the connection or a timeout/error.
+        // Loop until the client closes the connection (clean EOF), goes idle
+        // (CLIENT_IDLE_TIMEOUT), or hits an error.
         loop {
             let mut len_buf = [0u8; 2];
-            timeout(UPSTREAM_TIMEOUT, client_stream.read_exact(&mut len_buf))
-                .await
-                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Client read timeout"))??;
+            // Idle wait for the next query — long timeout, and a clean EOF or
+            // expiry closes the connection normally (not an error).
+            match timeout(CLIENT_IDLE_TIMEOUT, client_stream.read_exact(&mut len_buf)).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+                Ok(Err(e)) => return Err(e),
+                Err(_) => return Ok(()), // idle timeout: close quietly
+            }
             let len = u16::from_be_bytes(len_buf) as usize;
 
+            // Once the length prefix arrives, the body must follow promptly.
             let mut packet = vec![0u8; len];
             timeout(UPSTREAM_TIMEOUT, client_stream.read_exact(&mut packet))
                 .await
