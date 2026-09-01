@@ -269,7 +269,7 @@ mod tests {
             qtype: 1,
             qclass: 1,
         };
-        let mut msg = DnsMessage {
+        let msg = DnsMessage {
             header,
             questions: vec![question],
             answers: vec![],
@@ -355,7 +355,7 @@ mod tests {
         };
 
         msg.add_opt_record(1232);
-        assert!(msg.edns_do == false); // add_opt_record doesn't set edns_do on the msg itself, but adds the record
+        assert!(!msg.edns_do); // add_opt_record doesn't set edns_do on the msg itself, but adds the record
 
         // Wait, add_opt_record sets ttl bit.
         // DnsMessage::parse should detect it.

@@ -1,0 +1,80 @@
+//! Minimal journald native protocol sender.
+//!
+//! The journald native protocol is a single UNIX datagram to
+//! `/run/systemd/journal/socket`. Each field is `KEY=VALUE\n`. Journald adds
+//! the timestamp, unit name (from the sender's cgroup), and handles storage.
+//! If the socket doesn't exist (not under systemd), the send silently fails.
+//!
+//! No external crates. Query logs go through here; operational logs stay on
+//! `log::info!`/`env_logger`. Both end up in journald, but query entries carry
+//! `QUERY_*` structured fields for precise filtering:
+//!
+//! ```sh
+//! journalctl -u dns-ligase QUERY_ACTION=blocked
+//! journalctl -u dns-ligase QUERY_DOMAIN=ads.example.com
+//! ```
+
+use std::io;
+use std::os::unix::net::UnixDatagram;
+
+const JOURNAL_SOCKET: &str = "/run/systemd/journal/socket";
+
+/// Log a DNS query decision to journald with structured fields.
+///
+/// Silently does nothing if the journald socket is unavailable (e.g. running
+/// outside systemd), so this is safe to call unconditionally.
+pub fn log_query(
+    source: &str,
+    domain: &str,
+    qtype: &str,
+    action: &str,
+    rule: &str,
+) {
+    let priority = match action {
+        "blocked" => 6, // LOG_INFO
+        "allowed" => 7, // LOG_DEBUG
+        _ => 6,
+    };
+
+    let message = if rule.is_empty() {
+        format!("query {action} {domain} ({qtype}) from {source}")
+    } else {
+        format!("query {action} {domain} ({qtype}) from {source} [{rule}]")
+    };
+
+    let entry = format!(
+        "PRIORITY={priority}\n\
+         SYSLOG_IDENTIFIER=dns-ligase\n\
+         MESSAGE={message}\n\
+         QUERY_SOURCE={source}\n\
+         QUERY_DOMAIN={domain}\n\
+         QUERY_QTYPE={qtype}\n\
+         QUERY_ACTION={action}\n\
+         QUERY_RULE={rule}\n"
+    );
+
+    if let Err(e) = send(&entry) {
+        // Only log at debug to avoid spamming stderr when journald is absent.
+        log::debug!("journald send failed: {e}");
+    }
+}
+
+fn send(entry: &str) -> io::Result<()> {
+    let socket = UnixDatagram::unbound()?;
+    socket.connect(JOURNAL_SOCKET)?;
+    socket.send(entry.as_bytes())?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_log_query_does_not_panic_without_journald() {
+        // On a system without journald (or in a test environment), this should
+        // silently fail rather than panic.
+        log_query("192.168.1.5", "ads.example.com", "A", "blocked", "||ads.example.com^");
+        log_query("10.0.0.1", "example.com", "AAAA", "allowed", "");
+    }
+}

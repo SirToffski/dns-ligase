@@ -34,6 +34,18 @@ impl Blocklist {
     }
 
     pub fn parse_line(&mut self, line: &str, format: ListFormat) -> Result<(), Box<dyn Error>> {
+        self.parse_line_mode(line, format, false)
+    }
+
+    /// Parse a single line. When `as_allow` is true, every rule is routed to
+    /// the allow sets regardless of `@@` prefix — used for allowlist URL files
+    /// where bare domains and `||domain^` patterns should all be allow rules.
+    pub fn parse_line_mode(
+        &mut self,
+        line: &str,
+        format: ListFormat,
+        as_allow: bool,
+    ) -> Result<(), Box<dyn Error>> {
         let line = line.trim();
         if line.is_empty() || line.starts_with('!') || line.starts_with('#') {
             return Ok(());
@@ -42,12 +54,18 @@ impl Blocklist {
         match format {
             ListFormat::Hosts | ListFormat::PiHole => {
                 if let Some(domain) = Self::clean_domain_static(line) {
-                    self.block_domains.insert(domain.to_lowercase());
+                    let domain = domain.to_lowercase();
+                    if as_allow {
+                        self.allow_domains.insert(domain);
+                    } else {
+                        self.block_domains.insert(domain);
+                    }
                 }
             }
             ListFormat::AdBlock | ListFormat::AdGuard => {
-                let is_allow = line.starts_with("@@");
-                let pattern_part = if is_allow {
+                let has_at = line.starts_with("@@");
+                let is_allow = as_allow || has_at;
+                let pattern_part = if has_at {
                     line.trim_start_matches("@@")
                 } else {
                     line
@@ -91,15 +109,21 @@ impl Blocklist {
     }
 
     pub fn parse_auto(&mut self, line: &str) -> Result<(), Box<dyn Error>> {
+        self.parse_auto_mode(line, false)
+    }
+
+    /// Auto-detect format and parse. When `as_allow` is true, every rule is
+    /// routed to the allow sets.
+    pub fn parse_auto_mode(&mut self, line: &str, as_allow: bool) -> Result<(), Box<dyn Error>> {
         let line = line.trim();
         if line.is_empty() || line.starts_with('!') || line.starts_with('#') {
             return Ok(());
         }
 
         if line.starts_with("||") || line.starts_with("@@") || (line.starts_with('/') && line.ends_with('/')) {
-            self.parse_line(line, ListFormat::AdBlock)
+            self.parse_line_mode(line, ListFormat::AdBlock, as_allow)
         } else {
-            self.parse_line(line, ListFormat::Hosts)
+            self.parse_line_mode(line, ListFormat::Hosts, as_allow)
         }
     }
 
@@ -150,33 +174,51 @@ impl Blocklist {
         }
     }
 
+    #[allow(dead_code)]
     pub fn matches(&self, domain: &str) -> bool {
+        matches!(self.check(domain), MatchOutcome::Blocked(_))
+    }
+
+    /// Check a domain and return the outcome with the matched rule, if any.
+    /// Only allocates the rule description string when a rule actually matches.
+    pub fn check(&self, domain: &str) -> MatchOutcome {
         let domain_lower = domain.to_lowercase();
         // Allow takes precedence over block
         if self.allow_domains.contains(&domain_lower) {
-            return false;
+            return MatchOutcome::Allowed(format!("allow:{}", domain_lower));
         }
         for re in &self.allow_regex {
             if re.is_match(&domain_lower) {
-                return false;
+                return MatchOutcome::Allowed(format!("allow_regex:{}", re.as_str()));
             }
         }
         if Self::suffix_match(&self.allow_suffixes, &domain_lower) {
-            return false;
+            return MatchOutcome::Allowed(format!("allow_suffix:{}", domain_lower));
         }
         if self.block_domains.contains(&domain_lower) {
-            return true;
+            return MatchOutcome::Blocked(format!("block:{}", domain_lower));
         }
         if Self::suffix_match(&self.block_suffixes, &domain_lower) {
-            return true;
+            return MatchOutcome::Blocked(format!("block_suffix:{}", domain_lower));
         }
         for re in &self.block_regex {
             if re.is_match(&domain_lower) {
-                return true;
+                return MatchOutcome::Blocked(format!("block_regex:{}", re.as_str()));
             }
         }
-        false
+        MatchOutcome::Forwarded
     }
+}
+
+/// Outcome of checking a domain against the blocklist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MatchOutcome {
+    /// Blocked by a block rule.
+    Blocked(String),
+    /// Allowed by an allow rule (overrides any block).
+    Allowed(String),
+    /// Not matched by any rule; forward to upstream.
+    Forwarded,
 }
 
 /// Parse lines from a blocklist body into an existing Blocklist.
@@ -184,6 +226,13 @@ impl Blocklist {
 pub fn parse_lines_into(bl: &mut Blocklist, body: &str) {
     for line in body.lines() {
         let _ = bl.parse_auto(line);
+    }
+}
+
+/// Parse lines from an allowlist body, routing every entry to the allow sets.
+pub fn parse_lines_into_allow(bl: &mut Blocklist, body: &str) {
+    for line in body.lines() {
+        let _ = bl.parse_auto_mode(line, true);
     }
 }
 
@@ -278,7 +327,7 @@ impl CachedLists {
                 if let Some(cached) = self.map.get(url) {
                     return Ok(cached.body.clone());
                 }
-                return Err(io::Error::new(io::ErrorKind::Other, "304 but no cached body").into());
+                Err(io::Error::other("304 but no cached body").into())
             }
             reqwest::StatusCode::OK => {
                 let new_etag = resp
@@ -307,7 +356,7 @@ impl CachedLists {
                     log::warn!("Fetch returned {} for {}; using cached copy", resp.status(), url);
                     return Ok(cached.body.clone());
                 }
-                Err(io::Error::new(io::ErrorKind::Other, format!("HTTP {}", resp.status())).into())
+                Err(io::Error::other(format!("HTTP {}", resp.status())).into())
             }
         }
     }
@@ -479,5 +528,36 @@ mod tests {
         assert!(bl.matches("ads.com"));
         assert!(bl.matches("evil.ads.com"));
         assert!(!bl.matches("safe.ads.com"));
+    }
+
+    #[test]
+    fn test_parse_lines_into_allow_hosts_format() {
+        let mut bl = Blocklist::new();
+        // Block everything under ads.com
+        bl.parse_line("||ads.com^", ListFormat::AdBlock).unwrap();
+
+        // Allowlist body in hosts format: bare domains become allow rules
+        let body = "# allowlist\nexample.com\n0.0.0.0 safe.ads.com\n";
+        parse_lines_into_allow(&mut bl, body);
+
+        assert!(!bl.matches("example.com"), "allowlist entry should override");
+        assert!(!bl.matches("safe.ads.com"), "allowlist should override block suffix");
+        assert!(bl.matches("evil.ads.com"), "block suffix still applies elsewhere");
+    }
+
+    #[test]
+    fn test_parse_lines_into_allow_adblock_format() {
+        let mut bl = Blocklist::new();
+        bl.parse_line("||ads.com^", ListFormat::AdBlock).unwrap();
+
+        // Allowlist body in AdBlock format: ||domain^ and /regex/ become allow rules
+        let body = "||safe.ads.com^\n/^allow\\.me$/\n@@||redundant.ads.com^\n";
+        parse_lines_into_allow(&mut bl, body);
+
+        assert!(!bl.matches("safe.ads.com"), "|| suffix in allowlist should allow");
+        assert!(!bl.matches("sub.safe.ads.com"), "subdomain of allow suffix");
+        assert!(!bl.matches("allow.me"), "regex in allowlist should allow");
+        assert!(!bl.matches("redundant.ads.com"), "@@ in allowlist is still allow");
+        assert!(bl.matches("evil.ads.com"), "block still applies");
     }
 }

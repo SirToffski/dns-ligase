@@ -2,12 +2,14 @@ mod config;
 mod dns;
 mod blocklist;
 mod upstream;
+mod journald;
+mod stats;
 
 use crate::blocklist::{
-    parse_lines_into, Blocklist, CachedLists,
+    parse_lines_into, parse_lines_into_allow, Blocklist, CachedLists,
 };
 use crate::config::Config;
-use crate::upstream::UdpForwarder;
+use crate::upstream::{Upstream, UdpForwarder, UpstreamHandle};
 use std::collections::HashSet;
 use std::io;
 use std::sync::Arc;
@@ -16,6 +18,12 @@ use tokio::signal::unix::{signal, SignalKind};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Subcommand: `dns-ligase stats [flags]` — read and filter query logs.
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 && args[1] == "stats" {
+        return run_stats_cmd(&args[2..]);
+    }
+
     env_logger::init();
     log::info!("Starting DNS filter forwarder...");
 
@@ -35,8 +43,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Spawn refresh timer task
     spawn_refresh_task(Arc::clone(&config), Arc::clone(&blocklist), Arc::clone(&cache), cache_path.clone());
 
-    // Spawn SIGHUP reload task
-    spawn_sighup_handler(Arc::clone(&config), Arc::clone(&blocklist), Arc::clone(&cache), cache_path.clone());
+    let listen_addr = {
+        let cfg = config.read().await;
+        format!("{}:{}", cfg.server.listen_addr, cfg.server.listen_port)
+    };
+    let upstream_addr: std::net::SocketAddr = {
+        let cfg = config.read().await;
+        format!("{}:{}", cfg.upstream.address, cfg.upstream.port)
+            .parse()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("bad upstream: {e}")))?
+    };
+    let log_queries = {
+        let cfg = config.read().await;
+        cfg.logging.queries
+    };
+    log::info!("Listening on {} and forwarding to {}", listen_addr, upstream_addr);
+    if log_queries {
+        log::info!("Query logging to journald enabled");
+    }
+
+    // Shared flag so SIGHUP can toggle logging without restart.
+    let log_queries_handle: Arc<RwLock<bool>> = Arc::new(RwLock::new(log_queries));
+
+    // Spawn SIGHUP reload task (shares the upstream handle so it can swap pools
+    // when the upstream address changes).
+    let upstream_handle: UpstreamHandle =
+        Arc::new(RwLock::new(Arc::new(Upstream::new(upstream_addr))));
+    spawn_sighup_handler(
+        Arc::clone(&config),
+        Arc::clone(&blocklist),
+        Arc::clone(&cache),
+        cache_path.clone(),
+        Arc::clone(&upstream_handle),
+        Arc::clone(&log_queries_handle),
+    );
 
     // Spawn disk-persist task (save cache on graceful shutdown)
     let cache_shutdown = Arc::clone(&cache);
@@ -54,23 +94,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let listen_addr = {
-        let cfg = config.read().await;
-        format!("{}:{}", cfg.server.listen_addr, cfg.server.listen_port)
-    };
-    let upstream_addr: std::net::SocketAddr = {
-        let cfg = config.read().await;
-        format!("{}:{}", cfg.upstream.address, cfg.upstream.port)
-            .parse()
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("bad upstream: {e}")))?
-    };
-
-    log::info!("Listening on {} and forwarding to {}", listen_addr, upstream_addr);
-
-    let forwarder = UdpForwarder::new(&listen_addr, Arc::clone(&config), Arc::clone(&blocklist)).await?;
+    let forwarder = UdpForwarder::new(&listen_addr, Arc::clone(&upstream_handle), Arc::clone(&blocklist), Arc::clone(&log_queries_handle)).await?;
     forwarder.run().await?;
 
     Ok(())
+}
+
+/// Parse `stats` subcommand flags and run the stats query.
+fn run_stats_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut filter = stats::StatsFilter::default();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--blocked" => filter.blocked = true,
+            "--allowed" => filter.allowed = true,
+            "--forwarded" => filter.forwarded = true,
+            "--summary" => filter.summary = true,
+            "--domain" | "-d" => {
+                i += 1;
+                filter.domain = args.get(i).cloned();
+            }
+            "--src" | "-s" => {
+                i += 1;
+                filter.src = args.get(i).cloned();
+            }
+            "--since" => {
+                i += 1;
+                filter.since = args.get(i).cloned();
+            }
+            "--help" | "-h" => {
+                println!("Usage: dns-ligase stats [OPTIONS]");
+                println!();
+                println!("Options:");
+                println!("  --blocked       Show only blocked queries");
+                println!("  --allowed       Show only allowed queries");
+                println!("  --forwarded     Show only forwarded queries");
+                println!("  --domain <str>  Filter by domain substring");
+                println!("  --src <ip>      Filter by source IP substring");
+                println!("  --since <time>  journalctl time spec (e.g. \"1 hour ago\")");
+                println!("  --summary       Print aggregate summary instead of list");
+                println!();
+                println!("Pipe to fzf or grep for ad-hoc search:");
+                println!("  dns-ligase stats | fzf");
+                println!("  dns-ligase stats --blocked | grep doubleclick");
+                return Ok(());
+            }
+            other => {
+                return Err(format!("unknown stats flag: {other}").into());
+            }
+        }
+        i += 1;
+    }
+    stats::run_stats(filter)
 }
 
 async fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
@@ -123,6 +198,22 @@ async fn create_blocklist(config: &Config, cache: &Mutex<CachedLists>, cache_pat
         }
     }
 
+    // 2b. Fetch each allowlist URL (cached or fresh), merge as allow rules
+    let allow_urls = config.blocklists.allowlist_urls.clone();
+    for url in &allow_urls {
+        log::info!("Fetching allowlist: {}", url);
+        let mut c = cache.lock().await;
+        match c.fetch_or_cached(url, cache_ttl).await {
+            Ok(body) => {
+                log::info!("Allowlist fetched: {}", url);
+                parse_lines_into_allow(&mut bl, &body);
+            }
+            Err(e) => {
+                log::warn!("Fetch failed for allowlist {}, using cached: {}", url, e);
+            }
+        }
+    }
+
     log::info!(
         "Blocklist: {} block domains, {} block regex, {} allow domains, {} allow regex",
         bl.block_domains.len(), bl.block_regex.len(),
@@ -130,10 +221,11 @@ async fn create_blocklist(config: &Config, cache: &Mutex<CachedLists>, cache_pat
     );
 
     // 3. Prune stale entries and persist cache to disk
-    let urls = config.blocklists.urls.clone();
+    let mut keep_urls = config.blocklists.urls.clone();
+    keep_urls.extend(config.blocklists.allowlist_urls.iter().cloned());
     {
         let mut c = cache.lock().await;
-        c.prune(&urls);
+        c.prune(&keep_urls);
         let save_result = c.save_to_disk(cache_path);
         if let Err(e) = save_result {
             log::error!("Failed to save cache: {}", e);
@@ -180,6 +272,8 @@ fn spawn_sighup_handler(
     blocklist: Arc<RwLock<Blocklist>>,
     cache: Arc<Mutex<CachedLists>>,
     cache_path: String,
+    upstream: UpstreamHandle,
+    log_queries: Arc<RwLock<bool>>,
 ) {
     tokio::spawn(async move {
         match signal(SignalKind::hangup()) {
@@ -234,6 +328,16 @@ fn spawn_sighup_handler(
                             log::info!("Blocklist removed: {}", url);
                         }
 
+                        // Allowlist URLs
+                        let old_allow: HashSet<_> = old_config.blocklists.allowlist_urls.iter().collect();
+                        let new_allow: HashSet<_> = new_config.blocklists.allowlist_urls.iter().collect();
+                        for url in &new_allow - &old_allow {
+                            log::info!("Allowlist added: {}", url);
+                        }
+                        for url in &old_allow - &new_allow {
+                            log::info!("Allowlist removed: {}", url);
+                        }
+
                         // Refresh interval
                         if old_config.blocklists.refresh_interval_secs != new_config.blocklists.refresh_interval_secs {
                             log::info!(
@@ -246,6 +350,14 @@ fn spawn_sighup_handler(
                         // Cache path
                         if old_config.cache.path != new_config.cache.path {
                             log::info!("Cache path: {} -> {}", old_config.cache.path, new_config.cache.path);
+                        }
+
+                        // Query logging
+                        if old_config.logging.queries != new_config.logging.queries {
+                            log::info!(
+                                "Query logging: {} -> {}",
+                                old_config.logging.queries, new_config.logging.queries
+                            );
                         }
 
                         // Manual block domains
@@ -291,6 +403,37 @@ fn spawn_sighup_handler(
 
                     // Update config atomically
                     *config.write().await = new_config;
+
+                    // Apply the logging toggle without restart
+                    {
+                        let cfg = config.read().await;
+                        *log_queries.write().await = cfg.logging.queries;
+                    }
+
+                    // If the upstream address/port changed, swap in a fresh
+                    // connection pool. In-flight queries holding the old Arc
+                    // finish against the old address; new queries use the new.
+                    let new_upstream_addr: std::net::SocketAddr = {
+                        let cfg = config.read().await;
+                        match format!("{}:{}", cfg.upstream.address, cfg.upstream.port).parse() {
+                            Ok(a) => a,
+                            Err(e) => {
+                                log::error!("Bad upstream after reload, keeping old pool: {}", e);
+                                continue;
+                            }
+                        }
+                    };
+                    {
+                        let current = upstream.read().await.clone();
+                        if current.addr() != new_upstream_addr {
+                            log::info!(
+                                "Upstream pool: {} -> {}",
+                                current.addr(),
+                                new_upstream_addr
+                            );
+                            *upstream.write().await = Arc::new(Upstream::new(new_upstream_addr));
+                        }
+                    }
 
                     // Rebuild blocklist with new matching rules + remote fetches
                     // Clone config inside read block so guard drops before any work

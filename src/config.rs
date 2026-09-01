@@ -16,6 +16,8 @@ pub struct Config {
     pub matching: MatchingConfig,
     #[serde(default)]
     pub cache: CacheConfig,
+    #[serde(default)]
+    pub logging: LoggingConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -36,6 +38,15 @@ impl Default for CacheConfig {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct LoggingConfig {
+    /// Enable per-query logging to journald with structured fields.
+    /// When false, no query logs are emitted (operational logs still go to
+    /// stderr via env_logger). Defaults to false.
+    #[serde(default)]
+    pub queries: bool,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct UpstreamConfig {
     pub address: Ipv4Addr,
@@ -47,6 +58,10 @@ pub struct UpstreamConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct BlocklistConfig {
     pub urls: Vec<String>,
+    /// URLs fetched and parsed as allow rules. Shares the same refresh
+    /// interval, cache, and cache_ttl as blocklists.
+    #[serde(default)]
+    pub allowlist_urls: Vec<String>,
     pub refresh_interval_secs: u64,
     /// How long to use a cached blocklist body before refetching.
     /// Defaults to refresh_interval_secs if not set.

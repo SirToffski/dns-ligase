@@ -28,9 +28,11 @@ client → UDP/TCP listener → parse DNS wire format → extract QNAME
 | --- | --- |
 | `dns.rs` | Hand-rolled DNS wire format: header, question, resource record, message. Name parsing with compression-pointer support and jump limits, EDNS0/OPT handling. |
 | `blocklist.rs` | Rule storage and matching. List fetching with an on-disk cache, conditional GETs, and format parsing. |
-| `upstream.rs` | UDP and TCP listeners, blocklist check, NXDOMAIN construction, DO-bit injection, forwarding, timeouts. |
+| `upstream.rs` | Upstream connection pool (UDP + TCP, shared across queries), UDP and TCP listeners, blocklist check, NXDOMAIN construction, DO-bit injection, forwarding, truncation/TCP fallback, timeouts, query logging. |
+| `journald.rs` | Minimal journald native protocol sender for structured query logs (no external crate). |
+| `stats.rs` | `stats` subcommand: reads journald JSON, filters by action/domain/source/time, prints table or summary. |
 | `config.rs` | TOML config structs. |
-| `main.rs` | Wiring, initial list load, periodic refresh, SIGHUP reload, SIGTERM shutdown. |
+| `main.rs` | Wiring, initial list load, periodic refresh, SIGHUP reload, SIGTERM shutdown, `stats` subcommand dispatch. |
 
 ### Matching
 
@@ -73,15 +75,38 @@ Blocklists live behind `Arc<RwLock<Blocklist>>`. Query handlers take a read lock
 - Hand-written wire format parser and serializer
 - Name compression pointers with bounds checks and a jump limit
 - EDNS0: advertises a 1232-byte buffer, sets the DO bit on outgoing queries even when the client didn't, passes RRSIG/NSEC and the AD flag through untouched
+- Truncation handling: if an upstream UDP response comes back with the TC bit set, the query is retried over TCP to retrieve the full response; if the final response is still too large for the client's UDP path (its OPT buffer size, or 512 bytes with no OPT), a header-only response with the TC bit set is returned so the client retries over TCP
+- Upstream connection reuse: a bounded pool of connected UDP and TCP sockets to the upstream, shared across queries; timed-out or errored sockets are discarded rather than returned, so a late stray response can never leak into a later query
 - 2-second timeouts on all upstream I/O
 
 **Operations**
 
-- `SIGHUP` reloads config and rebuilds the blocklist, logging every individual change (lists added/removed, rules added/removed, upstream changed)
+- `SIGHUP` reloads config and rebuilds the blocklist, logging every individual change (lists added/removed, rules added/removed, upstream changed, query logging toggled)
 - `SIGTERM` saves the cache and exits cleanly
 - Config path via `--config`, `DNS_LIGASE_CONFIG`, or `./config.toml` in that order
 - systemd unit with `DynamicUser`, `ProtectSystem=strict`, and `ExecReload`
 - Arch `PKGBUILD` included
+
+**Query logging**
+
+- Optional per-query logging to journald with structured fields, enabled via `[logging] queries = true`
+- Each log entry carries: source IP, domain, query type, action (blocked/allowed/forwarded), and the matched rule
+- `dns-ligase stats` subcommand reads and filters the logs:
+  ```
+  dns-ligase stats                        # all recent queries
+  dns-ligase stats --blocked              # blocked only
+  dns-ligase stats --src 192.168.1.5      # from a specific client
+  dns-ligase stats --domain ads --blocked # blocked queries with "ads" in the domain
+  dns-ligase stats --since "1 hour ago"   # time window (journalctl syntax)
+  dns-ligase stats --summary              # aggregate: totals, top blocked, top sources
+  dns-ligase stats | fzf                  # fuzzy search interactively
+  ```
+- Log retention is controlled by journald globally; add a drop-in for 3 days:
+  ```
+  # /etc/systemd/journald.conf.d/retention.conf
+  [Journal]
+  MaxRetentionSec=3day
+  ```
 
 ## Requirements
 
@@ -133,6 +158,12 @@ urls = [
   "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts",
   "https://v.firebog.net/hosts/Prigent-Crypto.txt",
 ]
+# Optional: URLs fetched and parsed as allow rules. Same formats as blocklists
+# (hosts, AdBlock/uBO, Pi-hole, AdGuard). Every entry is treated as an allow
+# rule, overriding block rules. Shares the same refresh interval and cache.
+# allowlist_urls = [
+#   "https://raw.githubusercontent.com/anudeepND/whitelist/master/domains/whitelist.txt",
+# ]
 refresh_interval_secs = 3600
 # cache_ttl_secs = 3600    # optional; defaults to refresh_interval_secs
 
@@ -144,6 +175,11 @@ regex_allow = []
 
 [cache]
 # path = "/var/lib/dns-ligase/cache.json"   # defaults to $HOME/.cache/dns-ligase/cache.json
+
+[logging]
+# Enable per-query logging to journald with structured fields.
+# View with: dns-ligase stats [--blocked|--allowed|--src|--domain|--summary]
+queries = false
 ```
 
 If you point `upstream` at a public resolver instead of a local validating one, you lose the DNSSEC validation this is designed around.
@@ -209,15 +245,4 @@ journalctl -u dns-ligase -f
 
 Not yet implemented:
 
-- Truncation handling — no TC flag or TCP fallback for oversized UDP responses
-- Upstream connection reuse; a fresh socket is created per query
 - IPv6 upstreams (`UpstreamConfig.address` is `Ipv4Addr`)
-- Metrics or query logging of any kind
-
-## License
-
-MIT.
-
----
-
-*Built as a learning project, largely by pair-programming with local LLMs (Gemma 4 26B and Qwen 3.6 35B on llama.cpp) inside agentic harnesses. Nearly every bug found along the way was of the same kind: code that logged what it intended rather than what it did. Verify against `dig`, not against the log line.*
