@@ -1,0 +1,36 @@
+name: Build Arch package
+
+on:
+  workflow_dispatch:        # manual trigger only
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
+      options: --privileged   # needed for makepkg's fakeroot
+
+    steps:
+      - name: Install deps
+        run: |
+          pacman -Syu --noconfirm git rust
+
+      - uses: actions/checkout@v4
+
+      - name: Create build user
+        run: |
+          useradd -m builder
+          echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+          chown -R builder:builder .
+
+      - name: Build package
+        run: |
+          cd PKGBUILD
+          sudo -u builder makepkg -s --noconfirm
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dns-ligase-pkg
+          path: PKGBUILD/*.pkg.tar.zst
+          retention-days: 30
