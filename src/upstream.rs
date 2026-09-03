@@ -360,6 +360,36 @@ impl UdpForwarder {
             resp = upstream.tcp_query(&packet_to_send).await?;
         }
 
+        // CNAME cloaking check: parse the response and walk the answer section
+        // for CNAME records. If any target is blocked, return NXDOMAIN for the
+        // original question. A malformed response is relayed as-is (parse
+        // failure does not break forwarding).
+        if let Some(q) = msg.questions.first() {
+            if let Ok(resp_msg) = DnsMessage::parse(&resp) {
+                for rr in &resp_msg.answers {
+                    if rr.rtype != 5 {
+                        continue;
+                    }
+                    let Some(target) = &rr.cname_target else { continue };
+                    if let MatchOutcome::Blocked(rule) = blocklist.read().await.check(target) {
+                        log::info!("Blocking CNAME target {target} for {}", q.name);
+                        if *log_queries.read().await {
+                            journald::log_query(
+                                &client.ip().to_string(),
+                                &q.name,
+                                qtype_str(q.qtype),
+                                "blocked",
+                                &format!("cname:{target} {rule}"),
+                            );
+                        }
+                        let nx = build_nxdomain(&msg)?;
+                        socket.send_to(&nx, client).await?;
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
         // The full response may still be too large for the client's UDP path.
         // Signal truncation so the client retries over TCP.
         if resp.len() > client_udp_size {
@@ -461,6 +491,35 @@ impl UdpForwarder {
 
             let upstream = upstream.read().await.clone();
             let resp = upstream.tcp_query(&packet_to_send).await?;
+
+            // CNAME cloaking check: same as the UDP path. If a CNAME target in
+            // the answer section is blocked, return NXDOMAIN for the original
+            // question. A malformed response is relayed as-is.
+            if let Some(q) = msg.questions.first() {
+                if let Ok(resp_msg) = DnsMessage::parse(&resp) {
+                    for rr in &resp_msg.answers {
+                        if rr.rtype != 5 {
+                            continue;
+                        }
+                        let Some(target) = &rr.cname_target else { continue };
+                        if let MatchOutcome::Blocked(rule) = blocklist.read().await.check(target) {
+                            log::info!("Blocking CNAME target {target} for {}", q.name);
+                            if *log_queries.read().await {
+                                journald::log_query(
+                                    &client_addr.ip().to_string(),
+                                    &q.name,
+                                    qtype_str(q.qtype),
+                                    "blocked",
+                                    &format!("cname:{target} {rule}"),
+                                );
+                            }
+                            let nx = build_nxdomain(&msg)?;
+                            write_tcp_message(client_stream, &nx).await?;
+                            continue;
+                        }
+                    }
+                }
+            }
 
             write_tcp_message(client_stream, &resp).await?;
 
@@ -594,6 +653,7 @@ mod tests {
             rclass: 1,
             ttl: 300,
             rdata: vec![0u8; 600],
+            cname_target: None,
         };
         let opt = DnsResourceRecord {
             name: "".to_string(),
@@ -601,6 +661,7 @@ mod tests {
             rclass: 1232,
             ttl: 0x80000000,
             rdata: vec![],
+            cname_target: None,
         };
         let mut msg = query_msg("example.com");
         msg.header.flags = 0x8180; // QR|RD|RA
@@ -682,5 +743,96 @@ mod tests {
         // The pool should have reused the same connection: exactly one accept.
         let n = *accepted.lock().await;
         assert_eq!(n, 1, "second query must reuse the pooled connection");
+    }
+
+    // --- CNAME filtering tests ---
+
+    /// Build a raw DNS response for "metrics.site.com" with a CNAME answer.
+    /// If `compressed` is true, the CNAME target uses a compression pointer
+    /// back into the question section (pointing to "site.com" at offset 20).
+    fn build_cname_response(compressed: bool) -> Vec<u8> {
+        // Header: ID=0x1234, flags=0x8180 (QR|RD|RA, NOERROR), QD=1, AN=1, NS=0, AR=0
+        let mut buf = vec![
+            0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        ];
+        // Question: metrics.site.com, type A, class IN
+        // Offset 12: \x07metrics\x04site\x03com\x00
+        buf.extend_from_slice(b"\x07metrics\x04site\x03com\x00");
+        buf.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // type A, class IN
+        // Question ends at offset 34. "site.com" starts at offset 20 (0x14).
+
+        // Answer: CNAME for metrics.site.com -> target
+        buf.extend_from_slice(&[0xC0, 0x0C]); // name: pointer to offset 12
+        buf.extend_from_slice(&[0x00, 0x05]); // type CNAME
+        buf.extend_from_slice(&[0x00, 0x01]); // class IN
+        buf.extend_from_slice(&[0x00, 0x00, 0x01, 0x2C]); // TTL 300
+
+        if compressed {
+            // CNAME target: tracker.site.com — "tracker" + pointer to offset 20
+            let rdata: &[u8] = b"\x07tracker\xC0\x14";
+            buf.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+            buf.extend_from_slice(rdata);
+        } else {
+            // CNAME target: tracker.evil.net — fully uncompressed
+            let rdata: &[u8] = b"\x07tracker\x04evil\x03net\x00";
+            buf.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+            buf.extend_from_slice(rdata);
+        }
+        buf
+    }
+
+    #[test]
+    fn test_cname_target_with_compression_pointer() {
+        let resp = build_cname_response(true);
+        let msg = DnsMessage::parse(&resp).unwrap();
+        assert_eq!(msg.answers.len(), 1);
+        assert_eq!(msg.answers[0].rtype, 5);
+        assert_eq!(
+            msg.answers[0].cname_target.as_deref(),
+            Some("tracker.site.com"),
+            "CNAME target must resolve through compression pointer"
+        );
+    }
+
+    #[test]
+    fn test_cname_target_uncompressed() {
+        let resp = build_cname_response(false);
+        let msg = DnsMessage::parse(&resp).unwrap();
+        assert_eq!(msg.answers.len(), 1);
+        assert_eq!(msg.answers[0].rtype, 5);
+        assert_eq!(
+            msg.answers[0].cname_target.as_deref(),
+            Some("tracker.evil.net"),
+            "uncompressed CNAME target must resolve"
+        );
+    }
+
+    #[test]
+    fn test_no_cname_in_a_only_response() {
+        // A response with only an A record — no CNAME target should be found.
+        let mut msg = query_msg("example.com");
+        msg.header.flags = 0x8180;
+        msg.header.ancount = 1;
+        msg.answers = vec![DnsResourceRecord {
+            name: "example.com".to_string(),
+            rtype: 1,
+            rclass: 1,
+            ttl: 300,
+            rdata: vec![192, 0, 2, 1],
+            cname_target: None,
+        }];
+        let resp = msg.serialize().unwrap();
+        let parsed = DnsMessage::parse(&resp).unwrap();
+        assert_eq!(parsed.answers.len(), 1);
+        assert_eq!(parsed.answers[0].rtype, 1);
+        assert!(parsed.answers[0].cname_target.is_none());
+    }
+
+    #[test]
+    fn test_garbage_response_does_not_panic() {
+        // Truncated/garbage bytes — parsing must fail cleanly, not panic.
+        let garbage = [0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00];
+        let result = DnsMessage::parse(&garbage);
+        assert!(result.is_err());
     }
 }

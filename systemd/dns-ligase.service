@@ -25,7 +25,7 @@ Environment=HOME=/var/lib/dns-ligase
 # CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW
 
 # Resource limits
-MemoryMax=512M
+MemoryMax=1G
 
 # Logging (journald)
 StandardOutput=journal

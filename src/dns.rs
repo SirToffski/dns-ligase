@@ -74,6 +74,11 @@ pub struct DnsResourceRecord {
     pub rclass: u16,
     pub ttl: u32,
     pub rdata: Vec<u8>,
+    /// For CNAME records (rtype == 5), the resolved target domain name. CNAME
+    /// rdata is a domain name that may use compression pointers into the full
+    /// packet, so it must be parsed from the cursor (not the rdata slice).
+    /// None for all other record types.
+    pub cname_target: Option<String>,
 }
 
 impl DnsResourceRecord {
@@ -86,10 +91,23 @@ impl DnsResourceRecord {
         let ttl = u32::from_be_bytes(meta_buf[4..8].try_into().unwrap());
         let rdlength = u16::from_be_bytes(meta_buf[8..10].try_into().unwrap());
 
+        // For CNAME records, parse the target domain name from the rdata
+        // position (which may contain compression pointers into the full
+        // packet), then restore the cursor so the normal rdata read still
+        // happens. This is the only type whose rdata we need to interpret.
+        let cname_target = if rtype == 5 {
+            let saved = reader.position();
+            let target = parse_name(reader).ok();
+            reader.set_position(saved);
+            target
+        } else {
+            None
+        };
+
         let mut rdata = vec![0u8; rdlength as usize];
         reader.read_exact(&mut rdata)?;
 
-        Ok(Self { name, rtype, rclass, ttl, rdata })
+        Ok(Self { name, rtype, rclass, ttl, rdata, cname_target })
     }
 
     pub fn serialize(&self) -> io::Result<Vec<u8>> {
@@ -183,6 +201,7 @@ impl DnsMessage {
                 rclass: buffer_size,
                 ttl,
                 rdata: vec![],
+                cname_target: None,
             };
             self.additionals.push(opt);
             self.header.arcount += 1;

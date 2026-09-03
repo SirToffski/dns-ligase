@@ -1,4 +1,4 @@
-# Maintainer: SirToffski <47118864+SirToffski@users.noreply.github.com>
+# Maintainer: SirToffski <SirToffski@users.noreply.github.com>
 pkgname=dns-ligase-git
 _pkgname=dns-ligase
 pkgver=r12.9ed75b4
