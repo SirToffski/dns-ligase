@@ -427,7 +427,7 @@ impl UdpForwarder {
         // RFC 7766: a client may send multiple queries on one TCP connection.
         // Loop until the client closes the connection (clean EOF), goes idle
         // (CLIENT_IDLE_TIMEOUT), or hits an error.
-        loop {
+        'next_query: loop {
             let mut len_buf = [0u8; 2];
             // Idle wait for the next query — long timeout, and a clean EOF or
             // expiry closes the connection normally (not an error).
@@ -465,7 +465,7 @@ impl UdpForwarder {
                                 &rule,
                             );
                         }
-                        continue;
+                        continue 'next_query;
                     }
                     MatchOutcome::Allowed(rule) => {
                         if *log_queries.read().await {
@@ -515,7 +515,7 @@ impl UdpForwarder {
                             }
                             let nx = build_nxdomain(&msg)?;
                             write_tcp_message(client_stream, &nx).await?;
-                            continue;
+                            continue 'next_query;
                         }
                     }
                 }
@@ -830,8 +830,16 @@ mod tests {
 
     #[test]
     fn test_garbage_response_does_not_panic() {
-        // Truncated/garbage bytes — parsing must fail cleanly, not panic.
-        let garbage = [0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00];
+        // Valid header claiming 1 answer but no answer data follows — parsing
+        // must fail cleanly when trying to read the answer RR, not panic.
+        let garbage = [
+            0x12, 0x34, 0x81, 0x80, // ID, flags
+            0x00, 0x01, 0x00, 0x01, // QD=1, AN=1
+            0x00, 0x00, 0x00, 0x00, // NS=0, AR=0
+            // Question: "x" type A class IN
+            0x01, b'x', 0x00, 0x00, 0x01, 0x00, 0x01,
+            // No answer data — header claims 1 answer but packet ends here.
+        ];
         let result = DnsMessage::parse(&garbage);
         assert!(result.is_err());
     }
