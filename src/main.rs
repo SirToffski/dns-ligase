@@ -33,7 +33,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load or initialize cache
     let cache_path = config.read().await.cache.path.clone();
     let cache = Arc::new(Mutex::new(
-        CachedLists::load_from_disk(&cache_path).unwrap_or_default(),
+        CachedLists::load_from_disk(&cache_path).unwrap_or_else(|e| {
+            log::warn!("Cache format changed or unreadable; starting fresh: {e}");
+            CachedLists::default()
+        }),
     ));
 
     // Initialize Blocklist
@@ -187,7 +190,7 @@ async fn create_blocklist(config: &Config, cache: &Mutex<CachedLists>, cache_pat
     for url in &urls {
         log::info!("Fetching blocklist: {}", url);
         let mut c = cache.lock().await;
-        match c.fetch_or_cached(url, cache_ttl).await {
+        match c.fetch_or_cached(url, cache_ttl, cache_path).await {
             Ok(body) => {
                 log::info!("Blocklist fetched: {}", url);
                 parse_lines_into(&mut bl, &body);
@@ -203,7 +206,7 @@ async fn create_blocklist(config: &Config, cache: &Mutex<CachedLists>, cache_pat
     for url in &allow_urls {
         log::info!("Fetching allowlist: {}", url);
         let mut c = cache.lock().await;
-        match c.fetch_or_cached(url, cache_ttl).await {
+        match c.fetch_or_cached(url, cache_ttl, cache_path).await {
             Ok(body) => {
                 log::info!("Allowlist fetched: {}", url);
                 parse_lines_into_allow(&mut bl, &body);
@@ -225,7 +228,7 @@ async fn create_blocklist(config: &Config, cache: &Mutex<CachedLists>, cache_pat
     keep_urls.extend(config.blocklists.allowlist_urls.iter().cloned());
     {
         let mut c = cache.lock().await;
-        c.prune(&keep_urls);
+        c.prune(&keep_urls, cache_path);
         let save_result = c.save_to_disk(cache_path);
         if let Err(e) = save_result {
             log::error!("Failed to save cache: {}", e);

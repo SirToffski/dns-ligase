@@ -246,7 +246,3 @@ journalctl -u dns-ligase -f
 Not yet implemented:
 
 - IPv6 upstreams (`UpstreamConfig.address` is `Ipv4Addr`)
-
-## LLM Usage
-
-The code for this was written by local LLMs: Gemma 4 26B A4E and Qwen3.6 35B A3E. Ocassionally I pasted commit diffs to Opus 5 in chat UI to review for bugs an issues. However the coding work itself was done by local LLMs.

@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use regex::Regex;
@@ -248,14 +248,18 @@ pub fn merge_blocklist(target: &mut Blocklist, source: Blocklist) {
 }
 
 // ---------------------------------------------------------------------------
-// CachedLists: raw-body cache with freshness and disk persistence
+// CachedLists: metadata in memory, bodies on disk
 // ---------------------------------------------------------------------------
 
+/// Metadata for one cached list. The body is stored in a separate file on
+/// disk (under the bodies_dir derived from cache path), read on demand, and
+/// never held in RAM after parsing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedList {
-    pub body: String,
     pub fetched_at: u64,  // Unix timestamp (seconds)
     pub etag: Option<String>,
+    /// Body file name, relative to the bodies directory. Derived from the URL.
+    pub filename: String,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -265,38 +269,92 @@ pub struct CachedLists {
     dirty: bool,
 }
 
+/// Derive a deterministic, human-readable filename from a URL.
+///
+/// Strips the scheme, replaces every character outside [A-Za-z0-9._-] with
+/// '_', truncates to 100 chars, appends ".txt". Path separators (/ \) are
+/// replaced so a URL containing "../" cannot escape the cache directory.
+fn url_to_filename(url: &str) -> String {
+    let stripped = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    let sanitized: String = stripped
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let truncated = if sanitized.len() > 100 {
+        &sanitized[..100]
+    } else {
+        &sanitized
+    };
+    format!("{truncated}.txt")
+}
+
+/// Derive the bodies directory from the cache metadata path.
+/// E.g. "/var/lib/dns-ligase/cache.json" -> "/var/lib/dns-ligase/cache.d"
+fn bodies_dir(cache_path: &str) -> PathBuf {
+    Path::new(cache_path)
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("cache.d")
+}
+
 impl CachedLists {
     #[allow(dead_code)]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Get cached body if it was fetched within the interval.
+    /// Read a cached body from disk. Returns None if the file is missing or
+    /// unreadable — caller should treat the entry as stale.
+    fn read_body(&self, cache_path: &str, filename: &str) -> Option<String> {
+        let path = bodies_dir(cache_path).join(filename);
+        fs::read_to_string(&path).ok()
+    }
+
+    /// Write a body to disk. Creates the bodies directory if needed.
+    fn write_body(&self, cache_path: &str, filename: &str, body: &str) -> io::Result<()> {
+        let dir = bodies_dir(cache_path);
+        fs::create_dir_all(&dir)?;
+        let path = dir.join(filename);
+        fs::write(path, body)?;
+        Ok(())
+    }
+
+    /// Get cached body if it was fetched within the interval and the body
+    /// file exists on disk.
     #[allow(dead_code)]
-    pub fn get_if_fresh(&self, url: &str, interval_secs: u64) -> Option<String> {
+    pub fn get_if_fresh(&self, url: &str, interval_secs: u64, cache_path: &str) -> Option<String> {
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
         self.map.get(url).and_then(|c| {
-            // saturating_sub prevents panic on clock skew (NTP steps, copied cache)
             if now.saturating_sub(c.fetched_at) < interval_secs {
-                Some(c.body.clone())
+                self.read_body(cache_path, &c.filename)
             } else {
                 None
             }
         })
     }
 
-    /// Fetch a URL. If cached and fresh, return cached body.
-    /// Otherwise fetch fresh; on failure, return cached body if available.
+    /// Fetch a URL. If cached and fresh, read the body from disk and return it.
+    /// Otherwise fetch fresh; on failure, read the body from disk if available.
     pub async fn fetch_or_cached(
         &mut self,
         url: &str,
         interval_secs: u64,
+        cache_path: &str,
     ) -> Result<String, Box<dyn Error>> {
-        // Check cache freshness
-        if let Some(body) = self.get_if_fresh(url, interval_secs) {
+        // Check cache freshness — body must exist on disk
+        if let Some(body) = self.get_if_fresh(url, interval_secs, cache_path) {
             return Ok(body);
         }
 
@@ -312,10 +370,12 @@ impl CachedLists {
         let resp = match request.send().await {
             Ok(r) => r,
             Err(e) => {
-                // Network failure — fall back to cached body if available
+                // Network failure — fall back to cached body file if available
                 if let Some(cached) = self.map.get(url) {
-                    log::warn!("Fetch failed for {url} ({e}); using cached copy");
-                    return Ok(cached.body.clone());
+                    if let Some(body) = self.read_body(cache_path, &cached.filename) {
+                        log::warn!("Fetch failed for {url} ({e}); using cached copy");
+                        return Ok(body);
+                    }
                 }
                 return Err(e.into());
             }
@@ -323,11 +383,29 @@ impl CachedLists {
 
         match resp.status() {
             reqwest::StatusCode::NOT_MODIFIED => {
-                // Not modified — keep existing cache entry, return cached body
+                // Not modified — keep existing cache entry, read body from disk
                 if let Some(cached) = self.map.get(url) {
-                    return Ok(cached.body.clone());
+                    if let Some(body) = self.read_body(cache_path, &cached.filename) {
+                        return Ok(body);
+                    }
                 }
-                Err(io::Error::other("304 but no cached body").into())
+                // Body file missing despite a 304 — fall through to a full GET
+                log::warn!("304 for {url} but body file missing; refetching");
+                let resp2 = client.get(url).send().await?;
+                let body = resp2.text().await?;
+                let filename = url_to_filename(url);
+                self.write_body(cache_path, &filename, &body)?;
+                let now = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                self.map.insert(url.to_string(), CachedList {
+                    fetched_at: now,
+                    etag: None,
+                    filename,
+                });
+                self.dirty = true;
+                Ok(body)
             }
             reqwest::StatusCode::OK => {
                 let new_etag = resp
@@ -337,24 +415,29 @@ impl CachedLists {
                     .map(|s| s.to_string());
                 let body = resp.text().await?;
 
+                let filename = url_to_filename(url);
+                self.write_body(cache_path, &filename, &body)?;
+
                 let now = SystemTime::now()
                     .duration_since(SystemTime::UNIX_EPOCH)
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
 
                 self.map.insert(url.to_string(), CachedList {
-                    body: body.clone(),
                     fetched_at: now,
                     etag: new_etag,
+                    filename,
                 });
                 self.dirty = true;
                 Ok(body)
             }
             _ => {
-                // HTTP error (4xx/5xx) — fall back to cached body if available
+                // HTTP error (4xx/5xx) — fall back to cached body file if available
                 if let Some(cached) = self.map.get(url) {
-                    log::warn!("Fetch returned {} for {}; using cached copy", resp.status(), url);
-                    return Ok(cached.body.clone());
+                    if let Some(body) = self.read_body(cache_path, &cached.filename) {
+                        log::warn!("Fetch returned {} for {}; using cached copy", resp.status(), url);
+                        return Ok(body);
+                    }
                 }
                 Err(io::Error::other(format!("HTTP {}", resp.status())).into())
             }
@@ -362,16 +445,26 @@ impl CachedLists {
     }
 
     /// Remove cache entries whose URLs are no longer in the config.
-    pub fn prune(&mut self, keep_urls: &[String]) {
-        let keep: std::collections::HashSet<&str> = keep_urls.iter().map(|s| s.as_str()).collect();
+    /// Also deletes the corresponding body files from disk.
+    pub fn prune(&mut self, keep_urls: &[String], cache_path: &str) {
+        let keep: HashSet<&str> = keep_urls.iter().map(|s| s.as_str()).collect();
+        let dir = bodies_dir(cache_path);
         let before = self.map.len();
-        self.map.retain(|url, _| keep.contains(url.as_str()));
+        self.map.retain(|url, entry| {
+            if keep.contains(url.as_str()) {
+                true
+            } else {
+                // Delete the body file
+                let _ = fs::remove_file(dir.join(&entry.filename));
+                false
+            }
+        });
         if self.map.len() < before {
             self.dirty = true;
         }
     }
 
-    /// Persist cache to disk only if it has been modified since last save.
+    /// Persist cache metadata to disk only if modified since last save.
     pub fn save_to_disk(&mut self, path: &str) -> io::Result<()> {
         if !self.dirty {
             return Ok(());
@@ -385,7 +478,9 @@ impl CachedLists {
         Ok(())
     }
 
-    /// Load cache from disk. Returns default if file doesn't exist or is invalid.
+    /// Load cache metadata from disk. Returns Err if the file doesn't exist
+    /// or if the format is incompatible (e.g. old cache.json with body fields).
+    /// Callers use unwrap_or_default() to start fresh on failure.
     pub fn load_from_disk(path: &str) -> io::Result<Self> {
         let data = fs::read_to_string(path)?;
         let cache: CachedLists = serde_json::from_str(&data)?;
@@ -559,5 +654,150 @@ mod tests {
         assert!(!bl.matches("allow.me"), "regex in allowlist should allow");
         assert!(!bl.matches("redundant.ads.com"), "@@ in allowlist is still allow");
         assert!(bl.matches("evil.ads.com"), "block still applies");
+    }
+
+    // --- Cache body-on-disk tests ---
+
+    #[test]
+    fn test_url_to_filename_stable_and_safe() {
+        // Stable for the same URL
+        let f1 = url_to_filename("https://v.firebog.net/hosts/Prigent-Crypto.txt");
+        let f2 = url_to_filename("https://v.firebog.net/hosts/Prigent-Crypto.txt");
+        assert_eq!(f1, f2);
+        assert_eq!(f1, "v.firebog.net_hosts_Prigent-Crypto.txt.txt");
+
+        // Scheme stripped
+        let f3 = url_to_filename("http://example.com/list.txt");
+        assert_eq!(f3, "example.com_list.txt.txt");
+
+        // Path traversal blocked — no / or \ in the filename (.. without a
+        // separator is just a filename, not a traversal)
+        let evil = url_to_filename("https://evil.com/../../../etc/passwd");
+        assert!(!evil.contains('/'));
+        assert!(!evil.contains('\\'));
+    }
+
+    #[test]
+    fn test_url_to_filename_truncation() {
+        let long_url = format!("https://example.com/{}", "a".repeat(200));
+        let fname = url_to_filename(&long_url);
+        // 100 chars of sanitized URL + ".txt"
+        assert!(fname.len() <= 105);
+        assert!(fname.ends_with(".txt"));
+    }
+
+    #[test]
+    fn test_cache_round_trip() {
+        let dir = std::env::temp_dir().join("dns-ligase-test-round-trip");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache_path = dir.join("cache.json");
+        let path_str = cache_path.to_str().unwrap();
+
+        let mut cache = CachedLists::default();
+        // Simulate a fetch: write body file + metadata
+        let url = "https://example.com/list.txt";
+        let filename = url_to_filename(url);
+        cache.write_body(path_str, &filename, "example.com\nads.com\n").unwrap();
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        cache.map.insert(url.to_string(), CachedList {
+            fetched_at: now,
+            etag: Some("\"abc\"".to_string()),
+            filename: filename.clone(),
+        });
+        cache.dirty = true;
+        cache.save_to_disk(path_str).unwrap();
+
+        // Load metadata from disk
+        let loaded = CachedLists::load_from_disk(path_str).unwrap();
+        assert_eq!(loaded.map.len(), 1);
+        let entry = loaded.map.get(url).unwrap();
+        assert_eq!(entry.filename, filename);
+        assert_eq!(entry.etag.as_deref(), Some("\"abc\""));
+
+        // Body is retrievable from disk
+        let body = loaded.read_body(path_str, &entry.filename).unwrap();
+        assert_eq!(body, "example.com\nads.com\n");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_cache_missing_body_file_falls_back() {
+        let dir = std::env::temp_dir().join("dns-ligase-test-missing-body");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache_path = dir.join("cache.json");
+        let path_str = cache_path.to_str().unwrap();
+
+        let mut cache = CachedLists::default();
+        let url = "https://example.com/list.txt";
+        let filename = url_to_filename(url);
+
+        // Fresh metadata but no body file on disk
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        cache.map.insert(url.to_string(), CachedList {
+            fetched_at: now,
+            etag: None,
+            filename,
+        });
+
+        // get_if_fresh should return None because body file is missing
+        let result = cache.get_if_fresh(url, 3600, path_str);
+        assert!(result.is_none(), "missing body file must not return a body");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_prune_deletes_body_file() {
+        let dir = std::env::temp_dir().join("dns-ligase-test-prune");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache_path = dir.join("cache.json");
+        let path_str = cache_path.to_str().unwrap();
+
+        let mut cache = CachedLists::default();
+        let url = "https://example.com/removed.txt";
+        let keep_url = "https://example.com/kept.txt";
+        let fn_removed = url_to_filename(url);
+        let fn_kept = url_to_filename(keep_url);
+
+        // Write both body files
+        cache.write_body(path_str, &fn_removed, "removed\n").unwrap();
+        cache.write_body(path_str, &fn_kept, "kept\n").unwrap();
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        cache.map.insert(url.to_string(), CachedList {
+            fetched_at: now,
+            etag: None,
+            filename: fn_removed.clone(),
+        });
+        cache.map.insert(keep_url.to_string(), CachedList {
+            fetched_at: now,
+            etag: None,
+            filename: fn_kept.clone(),
+        });
+
+        // Prune: keep only keep_url
+        cache.prune(&[keep_url.to_string()], path_str);
+
+        assert_eq!(cache.map.len(), 1);
+        assert!(cache.map.contains_key(keep_url));
+
+        // The removed body file must be gone
+        let bodies = bodies_dir(path_str);
+        assert!(!bodies.join(&fn_removed).exists(), "pruned body file must be deleted");
+        assert!(bodies.join(&fn_kept).exists(), "kept body file must survive");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
