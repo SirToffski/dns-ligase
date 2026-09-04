@@ -272,8 +272,14 @@ pub struct CachedLists {
 /// Derive a deterministic, human-readable filename from a URL.
 ///
 /// Strips the scheme, replaces every character outside [A-Za-z0-9._-] with
-/// '_', truncates to 100 chars, appends ".txt". Path separators (/ \) are
-/// replaced so a URL containing "../" cannot escape the cache directory.
+/// '_', truncates the readable prefix to 100 chars, then appends a short
+/// FNV-1a hash of the *full* URL to avoid collisions when two URLs share a
+/// long common prefix. FNV-1a is used instead of `DefaultHasher` because its
+/// algorithm is specified and stable across Rust versions — a toolchain
+/// upgrade must not orphan the cache.
+///
+/// All output characters are ASCII by construction (every non-ASCII char is
+/// mapped to `_`), so byte-slicing at 100 is safe.
 fn url_to_filename(url: &str) -> String {
     let stripped = url
         .strip_prefix("https://")
@@ -294,7 +300,13 @@ fn url_to_filename(url: &str) -> String {
     } else {
         &sanitized
     };
-    format!("{truncated}.txt")
+    // FNV-1a hash of the full URL for collision resistance.
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in url.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    format!("{truncated}_{h:016x}.txt")
 }
 
 /// Derive the bodies directory from the cache metadata path.
@@ -392,6 +404,11 @@ impl CachedLists {
                 // Body file missing despite a 304 — fall through to a full GET
                 log::warn!("304 for {url} but body file missing; refetching");
                 let resp2 = client.get(url).send().await?;
+                let new_etag = resp2
+                    .headers()
+                    .get(reqwest::header::ETAG)
+                    .and_then(|h| h.to_str().ok())
+                    .map(|s| s.to_string());
                 let body = resp2.text().await?;
                 let filename = url_to_filename(url);
                 self.write_body(cache_path, &filename, &body)?;
@@ -401,7 +418,7 @@ impl CachedLists {
                     .unwrap_or(0);
                 self.map.insert(url.to_string(), CachedList {
                     fetched_at: now,
-                    etag: None,
+                    etag: new_etag,
                     filename,
                 });
                 self.dirty = true;
@@ -664,25 +681,44 @@ mod tests {
         let f1 = url_to_filename("https://v.firebog.net/hosts/Prigent-Crypto.txt");
         let f2 = url_to_filename("https://v.firebog.net/hosts/Prigent-Crypto.txt");
         assert_eq!(f1, f2);
-        assert_eq!(f1, "v.firebog.net_hosts_Prigent-Crypto.txt.txt");
+        // Readable prefix + FNV-1a hash suffix
+        assert!(
+            f1.starts_with("v.firebog.net_hosts_Prigent-Crypto.txt_"),
+            "filename should start with readable prefix: {f1}"
+        );
+        assert!(f1.ends_with(".txt"), "filename should end with .txt: {f1}");
 
-        // Scheme stripped
-        let f3 = url_to_filename("http://example.com/list.txt");
-        assert_eq!(f3, "example.com_list.txt.txt");
+        // Different URLs with same prefix produce different filenames
+        let a = url_to_filename("https://example.com/list-A.txt");
+        let b = url_to_filename("https://example.com/list-B.txt");
+        assert_ne!(a, b, "different URLs must not collide");
 
-        // Path traversal blocked — no / or \ in the filename (.. without a
-        // separator is just a filename, not a traversal)
+        // Path traversal blocked — no / or \ in the filename
         let evil = url_to_filename("https://evil.com/../../../etc/passwd");
         assert!(!evil.contains('/'));
         assert!(!evil.contains('\\'));
     }
 
     #[test]
+    fn test_url_to_filename_collision_resistance() {
+        // Two URLs that share a long common prefix (identical past 100 chars
+        // when sanitized) must produce different filenames thanks to the hash.
+        let prefix = format!("https://example.com/{}", "x".repeat(120));
+        let url_a = format!("{prefix}/a");
+        let url_b = format!("{prefix}/b");
+        let fa = url_to_filename(&url_a);
+        let fb = url_to_filename(&url_b);
+        assert_ne!(fa, fb, "URLs differing only past 100 chars must not collide");
+        // Both should share the readable prefix
+        assert_eq!(&fa[..100], &fb[..100]);
+    }
+
+    #[test]
     fn test_url_to_filename_truncation() {
         let long_url = format!("https://example.com/{}", "a".repeat(200));
         let fname = url_to_filename(&long_url);
-        // 100 chars of sanitized URL + ".txt"
-        assert!(fname.len() <= 105);
+        // 100 chars readable prefix + 1 underscore + 16 hex hash + ".txt" = 121
+        assert!(fname.len() <= 121, "filename too long: {} ({})", fname, fname.len());
         assert!(fname.ends_with(".txt"));
     }
 
