@@ -1,7 +1,12 @@
 [package]
 name = "rust_dns"
-version = "0.1.0"
-edition = "2021"
+version = "0.5.0"
+edition = "2026"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
 
 [[bin]]
 name = "dns-ligase"
