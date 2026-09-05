@@ -434,8 +434,12 @@ pub struct FetchJob {
 pub enum DownloadResult {
     /// New content: persist the body file and metadata.
     Fresh { body: String, etag: Option<String> },
-    /// Body served from the on-disk file (304 or error fallback): nothing to persist.
-    FromDisk(String),
+    /// 304 Not Modified: body file already on disk; refresh `fetched_at` to
+    /// restart the freshness window.
+    NotModified,
+    /// Failure but a stale body file was present: serve it WITHOUT refreshing
+    /// `fetched_at`, so a dead list is retried (not silenced for a full TTL).
+    StaleFallback(String),
     /// No body available (error message for the warning log).
     Failed(String),
 }
@@ -468,14 +472,14 @@ async fn download_one(
         Ok(r) => r,
         Err(e) => {
             return read_cached()
-                .map(DownloadResult::FromDisk)
+                .map(DownloadResult::StaleFallback)
                 .unwrap_or_else(|| DownloadResult::Failed(format!("request failed: {e}")));
         }
     };
     match resp.status() {
         reqwest::StatusCode::NOT_MODIFIED => {
-            if let Some(body) = read_cached() {
-                DownloadResult::FromDisk(body)
+            if read_cached().is_some() {
+                DownloadResult::NotModified
             } else {
                 // Body file missing despite a 304 — do a full unconditional GET.
                 log::warn!("304 for {url} but body file missing; refetching");
@@ -499,7 +503,7 @@ async fn download_one(
             }
         }
         status => read_cached()
-            .map(DownloadResult::FromDisk)
+            .map(DownloadResult::StaleFallback)
             .unwrap_or_else(|| DownloadResult::Failed(format!("HTTP {status}"))),
     }
 }
@@ -610,8 +614,9 @@ impl CachedLists {
         out
     }
 
-    /// Phase 3 (sync — call under a brief lock): persist fresh downloads and
-    /// return every usable (url, body), from disk or network. Logs failures.
+    /// Phase 3 (sync — call under a brief lock): persist fresh downloads,
+    /// refresh `fetched_at` on 304s, and return every usable (url, body),
+    /// from disk or network. Logs failures.
     pub fn merge_downloads(
         &mut self,
         results: Vec<(String, DownloadResult)>,
@@ -638,7 +643,29 @@ impl CachedLists {
                     self.dirty = true;
                     bodies.push((url, body));
                 }
-                DownloadResult::FromDisk(body) => bodies.push((url, body)),
+                DownloadResult::NotModified => {
+                    // Refresh the freshness window; the body file is authoritative.
+                    if let Some(entry) = self.map.get_mut(url.as_str()) {
+                        entry.fetched_at = now;
+                        self.dirty = true;
+                        let filename = entry.filename.clone();
+                        if let Some(body) = read_body_file(cache_path, &filename) {
+                            bodies.push((url, body));
+                        } else {
+                            log::warn!("304 for {url} but body file missing; will refetch next cycle");
+                        }
+                    } else {
+                        // Entry vanished between plan and merge (e.g. URL removed
+                        // by a SIGHUP reload racing this refresh). Serve the file
+                        // if it is still there; there is no metadata to refresh.
+                        log::debug!("304 for {url} with no cache entry; serving file if present");
+                        let filename = url_to_filename(&url);
+                        if let Some(body) = read_body_file(cache_path, &filename) {
+                            bodies.push((url, body));
+                        }
+                    }
+                }
+                DownloadResult::StaleFallback(body) => bodies.push((url, body)),
                 DownloadResult::Failed(err) => {
                     log::warn!("Fetch failed for {url}, no cached copy: {err}");
                 }
@@ -952,10 +979,21 @@ mod tests {
         let stale_url = "https://example.com/stale.txt";
         let stale_fn = url_to_filename(stale_url);
         cache.write_body(path_str, &stale_fn, "stale-body\n").unwrap();
+        let stale_at = now.saturating_sub(7200);
         cache.map.insert(stale_url.to_string(), CachedList {
-            fetched_at: now.saturating_sub(7200),
+            fetched_at: stale_at,
             etag: Some("\"s\"".to_string()),
             filename: stale_fn,
+        });
+        // Second stale entry, for the error-fallback path.
+        let deadish_url = "https://example.com/deadish.txt";
+        let deadish_fn = url_to_filename(deadish_url);
+        cache.write_body(path_str, &deadish_fn, "deadish-body\n").unwrap();
+        let deadish_at = now.saturating_sub(7200);
+        cache.map.insert(deadish_url.to_string(), CachedList {
+            fetched_at: deadish_at,
+            etag: None,
+            filename: deadish_fn,
         });
 
         let new_url = "https://new.example/x.txt";
@@ -973,30 +1011,35 @@ mod tests {
         let new_job = jobs.iter().find(|j| j.url == new_url).unwrap();
         assert_eq!(new_job.etag, None);
 
-        // Merge: one fresh download, one disk reuse, one failure.
+        // Merge: one fresh download, one 304, one error fallback, one failure.
         let merged = cache.merge_downloads(
             vec![
                 (new_url.to_string(), DownloadResult::Fresh {
                     body: "new-body\n".to_string(),
                     etag: None,
                 }),
-                (stale_url.to_string(), DownloadResult::FromDisk("stale-body\n".to_string())),
+                (stale_url.to_string(), DownloadResult::NotModified),
+                (deadish_url.to_string(), DownloadResult::StaleFallback("deadish-body\n".to_string())),
                 ("https://dead.example/y.txt".to_string(), DownloadResult::Failed("boom".to_string())),
             ],
             path_str,
         );
-        assert_eq!(merged.len(), 2);
+        assert_eq!(merged.len(), 3);
         // Fresh download persisted to disk and metadata.
         let entry = cache.map.get(new_url).unwrap();
         assert_eq!(
             cache.read_body(path_str, &entry.filename).as_deref(),
             Some("new-body\n")
         );
-        // Disk reuse leaves existing metadata untouched (304 semantics).
-        assert_eq!(
-            cache.map.get(stale_url).unwrap().etag.as_deref(),
-            Some("\"s\"")
-        );
+        // 304 refreshes the freshness window; the body still comes from disk.
+        let stale_entry = cache.map.get(stale_url).unwrap();
+        assert!(stale_entry.fetched_at > stale_at);
+        assert_eq!(stale_entry.etag.as_deref(), Some("\"s\""));
+        assert!(merged.iter().any(|(u, b)| u == stale_url && b == "stale-body\n"));
+        // Error fallback serves the stale copy WITHOUT refreshing the
+        // timestamp, so a dead list keeps retrying instead of going quiet.
+        assert_eq!(cache.map.get(deadish_url).unwrap().fetched_at, deadish_at);
+        assert!(merged.iter().any(|(u, b)| u == deadish_url && b == "deadish-body\n"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

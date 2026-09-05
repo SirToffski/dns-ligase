@@ -244,8 +244,6 @@ journalctl -u dns-ligase -f
 ## Known issues
 
 - **`use_tcp` config field** is parsed but ignored; upstream transport follows the client's transport, not config.
-- **A `304 Not Modified` doesn't refresh `fetched_at`**, so once a list's TTL expires you get a conditional GET on every reload rather than restarting the freshness window. Cheap, but not ideal.
-- **The startup log line doesn't report suffix-set sizes**, which are now where most rules live.
 - **Cold boot with an unreachable upstream and an empty cache yields empty lists** (fail-open). It recovers on the next refresh once the upstream is reachable.
 
 Not yet implemented:
