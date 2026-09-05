@@ -8,7 +8,8 @@ It is intended to sit in front of a local validating resolver (unbound) as a lig
 
 ## Why
 
-The goal was a resolver path made of parts I've actually read. AdGuard Home works fine, but it's a large third-party binary serving DNS for every device in the house, with a web server and update machinery attached. This does the one thing I need — filter, then forward — in a few thousand lines.
+The goal was a resolver path made of parts I've actually read. AdGuard Home works fine, but it's a large third-party binary serving DNS for every device in the house, with a web server and update machinery attached. This does the
+one thing I need — filter, then forward — in a few thousand lines.
 
 The DNS wire protocol is parsed by hand rather than pulled from a crate. That was the point of the exercise. Crates are used for the genuinely solved problems (TLS, regex, async runtime, allocation).
 
@@ -67,7 +68,7 @@ List refreshes fetch all URLs concurrently and never hold the cache lock across 
 
 **Fetching**
 
-- Raw list bodies cached on disk as JSON, surviving restarts
+- List bodies cached on disk, surviving restarts: `cache.json` holds per-URL metadata (fetch time, ETag, filename) and a `cache.d/` directory next to it holds the raw list text files (e.g. with `path = "/var/lib/dns-ligase/cache.json"`, bodies live in `/var/lib/dns-ligase/cache.d/`)
 - Conditional GETs with `If-None-Match`; a `304` skips the download entirely
 - Configurable freshness window (`cache_ttl_secs`) — lists within it aren't refetched
 - On fetch failure (network error or HTTP 4xx/5xx), the last good copy is used rather than silently dropping thousands of rules
