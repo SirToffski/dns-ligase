@@ -33,3 +33,6 @@ serde_json = "1.0"
 # Already an indirect dep via reqwest; declared explicitly so the fetch path
 # doesn't rely on transitive deps. Do NOT hand-roll URL parsing.
 url = "2"
+# global allocator: lower fragmentation / better throughput for the
+# many small short-lived allocations on the query hot path
+mimalloc = { version = "0.1", default-features = false }

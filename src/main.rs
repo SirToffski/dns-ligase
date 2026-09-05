@@ -5,6 +5,9 @@ mod upstream;
 mod journald;
 mod stats;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use crate::blocklist::{
     parse_lines_into, parse_lines_into_allow, Blocklist, CachedLists,
 };
