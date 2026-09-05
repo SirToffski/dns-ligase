@@ -39,13 +39,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }),
     ));
 
-    // Initialize Blocklist
-    let cfg_init = config.read().await.clone();
-    let blocklist = Arc::new(RwLock::new(create_blocklist(&cfg_init, &cache, &cache_path).await));
-
-    // Spawn refresh timer task
-    spawn_refresh_task(Arc::clone(&config), Arc::clone(&blocklist), Arc::clone(&cache), cache_path.clone());
-
     let listen_addr = {
         let cfg = config.read().await;
         format!("{}:{}", cfg.server.listen_addr, cfg.server.listen_port)
@@ -56,6 +49,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .parse()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("bad upstream: {e}")))?
     };
+    // The upstream pool must exist before the first fetch so list hostnames
+    // can be resolved through it instead of the system resolver.
+    let upstream_handle: UpstreamHandle =
+        Arc::new(RwLock::new(Arc::new(Upstream::new(upstream_addr))));
+
+    // Initialize Blocklist
+    let cfg_init = config.read().await.clone();
+    let upstream_init = upstream_handle.read().await.clone();
+    let blocklist = Arc::new(RwLock::new(create_blocklist(&cfg_init, &cache, &cache_path, &upstream_init).await));
+
+    // Spawn refresh timer task
+    spawn_refresh_task(Arc::clone(&config), Arc::clone(&blocklist), Arc::clone(&cache), cache_path.clone(), Arc::clone(&upstream_handle));
+
     let log_queries = {
         let cfg = config.read().await;
         cfg.logging.queries
@@ -70,8 +76,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Spawn SIGHUP reload task (shares the upstream handle so it can swap pools
     // when the upstream address changes).
-    let upstream_handle: UpstreamHandle =
-        Arc::new(RwLock::new(Arc::new(Upstream::new(upstream_addr))));
     spawn_sighup_handler(
         Arc::clone(&config),
         Arc::clone(&blocklist),
@@ -163,7 +167,8 @@ async fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
 }
 
 /// Create a Blocklist from config: manual rules + all blocklist URLs (cached or fresh).
-async fn create_blocklist(config: &Config, cache: &Mutex<CachedLists>, cache_path: &str) -> Blocklist {
+/// List hostnames are resolved through `upstream` (not the system resolver).
+async fn create_blocklist(config: &Config, cache: &Mutex<CachedLists>, cache_path: &str, upstream: &Upstream) -> Blocklist {
     let mut bl = Blocklist::new();
 
     // 1. Apply manual rules
@@ -190,7 +195,7 @@ async fn create_blocklist(config: &Config, cache: &Mutex<CachedLists>, cache_pat
     for url in &urls {
         log::info!("Fetching blocklist: {}", url);
         let mut c = cache.lock().await;
-        match c.fetch_or_cached(url, cache_ttl, cache_path).await {
+        match c.fetch_or_cached(url, cache_ttl, cache_path, upstream).await {
             Ok(body) => {
                 log::info!("Blocklist fetched: {}", url);
                 parse_lines_into(&mut bl, &body);
@@ -206,7 +211,7 @@ async fn create_blocklist(config: &Config, cache: &Mutex<CachedLists>, cache_pat
     for url in &allow_urls {
         log::info!("Fetching allowlist: {}", url);
         let mut c = cache.lock().await;
-        match c.fetch_or_cached(url, cache_ttl, cache_path).await {
+        match c.fetch_or_cached(url, cache_ttl, cache_path, upstream).await {
             Ok(body) => {
                 log::info!("Allowlist fetched: {}", url);
                 parse_lines_into_allow(&mut bl, &body);
@@ -243,6 +248,7 @@ fn spawn_refresh_task(
     blocklist: Arc<RwLock<Blocklist>>,
     cache: Arc<Mutex<CachedLists>>,
     cache_path: String,
+    upstream: UpstreamHandle,
 ) {
     tokio::spawn(async move {
         loop {
@@ -259,7 +265,9 @@ fn spawn_refresh_task(
                 cfg.clone()
             };
 
-            let new_blocklist = create_blocklist(&cfg, &cache, &cache_path).await;
+            // Clone the current pool without holding the lock across I/O.
+            let up = upstream.read().await.clone();
+            let new_blocklist = create_blocklist(&cfg, &cache, &cache_path, &up).await;
 
             {
                 let mut lock = blocklist.write().await;
@@ -444,7 +452,10 @@ fn spawn_sighup_handler(
                         let cfg = config.read().await;
                         cfg.clone()
                     };
-                    let new_blocklist = create_blocklist(&cfg_reload, &cache, &cache_path).await;
+                    // Resolve list hostnames through the (possibly just-swapped)
+                    // upstream pool.
+                    let up = upstream.read().await.clone();
+                    let new_blocklist = create_blocklist(&cfg_reload, &cache, &cache_path, &up).await;
                     *blocklist.write().await = new_blocklist;
                     log::info!("Configuration reloaded successfully.");
                 }

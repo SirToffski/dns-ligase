@@ -1,7 +1,8 @@
 use std::collections::VecDeque;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{Mutex, RwLock};
@@ -26,6 +27,11 @@ const CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// created rather than blocking, so a burst never stalls.
 const UDP_POOL_CAP: usize = 16;
 const TCP_POOL_CAP: usize = 8;
+
+/// Monotonic counter for internally-generated query IDs (e.g. resolve_a).
+/// A counter is sufficient here — the IDs only need to be unique per
+/// in-flight query on our pooled sockets, not unpredictable.
+static INTERNAL_QUERY_ID: AtomicU16 = AtomicU16::new(1);
 
 /// A pool of connected sockets to a single upstream resolver.
 ///
@@ -56,6 +62,21 @@ impl Upstream {
 
     pub fn addr(&self) -> SocketAddr {
         self.addr
+    }
+
+    /// Resolve `host` to IPv4 addresses via the configured upstream.
+    ///
+    /// Builds an A query, sends it through the existing pooled UDP path
+    /// (reusing connection pooling, timeouts, and response-ID validation),
+    /// and returns the answer-section A records. An empty Vec means the
+    /// response carried no A records — the caller decides what to do.
+    pub async fn resolve_a(&self, host: &str) -> io::Result<Vec<Ipv4Addr>> {
+        let id = INTERNAL_QUERY_ID.fetch_add(1, Ordering::Relaxed);
+        let query = DnsMessage::new_query(id, host, 1);
+        let wire = query.serialize()?;
+        let resp_bytes = self.udp_query(&wire).await?;
+        let resp = DnsMessage::parse(&resp_bytes)?;
+        Ok(resp.a_records())
     }
 
     /// Forward a query over UDP and return the full response.

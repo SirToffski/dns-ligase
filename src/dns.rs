@@ -1,5 +1,6 @@
 use std::convert::TryInto;
 use std::io::{self, Cursor, Read};
+use std::net::Ipv4Addr;
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct DnsHeader {
@@ -132,6 +133,41 @@ pub struct DnsMessage {
 }
 
 impl DnsMessage {
+    /// Build a standard query: RD set, one question, qclass IN.
+    pub fn new_query(id: u16, name: &str, qtype: u16) -> Self {
+        Self {
+            header: DnsHeader {
+                id,
+                flags: 0x0100,
+                qdcount: 1,
+                ancount: 0,
+                nscount: 0,
+                arcount: 0,
+            },
+            questions: vec![DnsQuestion {
+                name: name.to_string(),
+                qtype,
+                qclass: 1,
+            }],
+            answers: vec![],
+            authorities: vec![],
+            additionals: vec![],
+            edns_do: false,
+        }
+    }
+
+    /// Extract IPv4 addresses from the answer section (rtype == 1,
+    /// rdata.len() == 4). CNAME records (rtype == 5) and malformed A records
+    /// are ignored — a CNAME ahead of the A records is normal and needs no
+    /// special handling since we only want the final addresses.
+    pub fn a_records(&self) -> Vec<Ipv4Addr> {
+        self.answers
+            .iter()
+            .filter(|rr| rr.rtype == 1 && rr.rdata.len() == 4)
+            .map(|rr| Ipv4Addr::new(rr.rdata[0], rr.rdata[1], rr.rdata[2], rr.rdata[3]))
+            .collect()
+    }
+
     pub fn parse(data: &[u8]) -> io::Result<Self> {
         let mut reader = Cursor::new(data);
         let header = DnsHeader::parse(&mut reader)?;
@@ -384,5 +420,92 @@ mod tests {
         assert_eq!(parsed.additionals.len(), 1);
         assert_eq!(parsed.additionals[0].rtype, 41);
         assert_eq!(parsed.additionals[0].rclass, 1232);
+    }
+
+    #[test]
+    fn test_new_query_round_trip() {
+        let msg = DnsMessage::new_query(0xABCD, "example.com", 1);
+        assert_eq!(msg.header.flags, 0x0100);
+        assert_eq!(msg.header.qdcount, 1);
+        let serialized = msg.serialize().unwrap();
+        let parsed = DnsMessage::parse(&serialized).unwrap();
+        assert_eq!(parsed.header.id, 0xABCD);
+        assert_eq!(parsed.header.flags & 0x0100, 0x0100);
+        assert_eq!(parsed.questions.len(), 1);
+        assert_eq!(parsed.questions[0].name, "example.com");
+        assert_eq!(parsed.questions[0].qtype, 1);
+        assert_eq!(parsed.questions[0].qclass, 1);
+    }
+
+    fn a_rr(name: &str, octets: [u8; 4]) -> crate::dns::DnsResourceRecord {
+        crate::dns::DnsResourceRecord {
+            name: name.to_string(),
+            rtype: 1,
+            rclass: 1,
+            ttl: 300,
+            rdata: octets.to_vec(),
+            cname_target: None,
+        }
+    }
+
+    fn cname_rr(name: &str, target: &str) -> crate::dns::DnsResourceRecord {
+        crate::dns::DnsResourceRecord {
+            name: name.to_string(),
+            rtype: 5,
+            rclass: 1,
+            ttl: 300,
+            rdata: crate::dns::serialize_name(target),
+            cname_target: Some(target.to_string()),
+        }
+    }
+
+    #[test]
+    fn test_a_records_with_cname_then_two_a() {
+        let mut msg = DnsMessage::new_query(1, "example.com", 1);
+        msg.answers = vec![
+            cname_rr("example.com", "alias.example.net"),
+            a_rr("alias.example.net", [93, 184, 216, 34]),
+            a_rr("alias.example.net", [93, 184, 216, 35]),
+        ];
+        let addrs = msg.a_records();
+        assert_eq!(
+            addrs,
+            vec![
+                Ipv4Addr::new(93, 184, 216, 34),
+                Ipv4Addr::new(93, 184, 216, 35),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_a_records_only_cname_is_empty() {
+        let mut msg = DnsMessage::new_query(1, "example.com", 1);
+        msg.answers = vec![cname_rr("example.com", "alias.example.net")];
+        assert!(msg.a_records().is_empty());
+    }
+
+    #[test]
+    fn test_a_records_ignores_malformed() {
+        let mut msg = DnsMessage::new_query(1, "example.com", 1);
+        msg.answers = vec![
+            crate::dns::DnsResourceRecord {
+                name: "example.com".to_string(),
+                rtype: 1,
+                rclass: 1,
+                ttl: 300,
+                rdata: vec![1, 2, 3], // too short
+                cname_target: None,
+            },
+            crate::dns::DnsResourceRecord {
+                name: "example.com".to_string(),
+                rtype: 1,
+                rclass: 1,
+                ttl: 300,
+                rdata: vec![1, 2, 3, 4, 5], // too long
+                cname_target: None,
+            },
+            a_rr("example.com", [9, 9, 9, 9]),
+        ];
+        assert_eq!(msg.a_records(), vec![Ipv4Addr::new(9, 9, 9, 9)]);
     }
 }

@@ -184,6 +184,8 @@ queries = false
 
 If you point `upstream` at a public resolver instead of a local validating one, you lose the DNSSEC validation this is designed around.
 
+Blocklist hostnames are resolved through that same `[upstream]`, not the system resolver — so dns-ligase can be the system resolver (`127.0.0.1` in NetworkManager / `/etc/resolv.conf`) without deadlocking at boot. If you previously worked around this with a second unbound listener (e.g. `127.0.0.2:53`) plus a NetworkManager `ipv4.dns` override, that workaround is no longer needed once this is verified: point DNS at dns-ligase itself and remove the extra listener. Deliberately a manual step — nothing in code touches it.
+
 Everything except `listen_addr` and `listen_port` is reloadable with `SIGHUP`:
 
 ```bash

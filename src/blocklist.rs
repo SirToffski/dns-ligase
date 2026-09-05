@@ -2,11 +2,14 @@ use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fs;
 use std::io;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+
+use crate::upstream::Upstream;
 
 #[derive(Debug, Default)]
 pub struct Blocklist {
@@ -318,6 +321,59 @@ fn bodies_dir(cache_path: &str) -> PathBuf {
         .join("cache.d")
 }
 
+/// Build an HTTP client for fetching `url_str`, pinning the URL's hostname to
+/// addresses resolved through our own upstream.
+///
+/// TLS still uses the hostname for SNI and certificate validation — only the
+/// address lookup is overridden. On any resolution failure (parse error, IP
+/// literal, upstream unreachable, no A records) returns a plain client so the
+/// system resolver gets a chance as a backstop.
+async fn client_for_url(url_str: &str, upstream: &Upstream) -> reqwest::Client {
+    let parsed = match url::Url::parse(url_str) {
+        Ok(u) => u,
+        Err(e) => {
+            log::warn!("Could not parse list URL {url_str} ({e}); using system resolver");
+            return reqwest::Client::new();
+        }
+    };
+    let host = match parsed.host_str() {
+        Some(h) => h.to_string(),
+        None => {
+            log::warn!("List URL {url_str} has no hostname; using system resolver");
+            return reqwest::Client::new();
+        }
+    };
+    // IP literals need no resolution.
+    if host.parse::<IpAddr>().is_ok() {
+        return reqwest::Client::new();
+    }
+    let ips = match upstream.resolve_a(&host).await {
+        Ok(ips) if !ips.is_empty() => ips,
+        Ok(_) => {
+            log::warn!("Upstream returned no A records for {host}; using system resolver");
+            return reqwest::Client::new();
+        }
+        Err(e) => {
+            log::warn!("Upstream resolution failed for {host} ({e}); using system resolver");
+            return reqwest::Client::new();
+        }
+    };
+    // The port in the override addr is ignored by reqwest (it uses the URL's
+    // own port / scheme default); pass the URL's effective port anyway.
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    let addrs: Vec<SocketAddr> = ips
+        .into_iter()
+        .map(|ip| SocketAddr::new(IpAddr::V4(ip), port))
+        .collect();
+    reqwest::Client::builder()
+        .resolve_to_addrs(&host, &addrs)
+        .build()
+        .unwrap_or_else(|e| {
+            log::warn!("Failed to build resolving client for {host} ({e}); using system resolver");
+            reqwest::Client::new()
+        })
+}
+
 impl CachedLists {
     #[allow(dead_code)]
     pub fn new() -> Self {
@@ -359,19 +415,30 @@ impl CachedLists {
 
     /// Fetch a URL. If cached and fresh, read the body from disk and return it.
     /// Otherwise fetch fresh; on failure, read the body from disk if available.
+    ///
+    /// The list hostname is resolved through our own `upstream` first so the
+    /// service doesn't depend on the system resolver (which may itself point
+    /// at dns-ligase). If our resolution fails or yields nothing, falls back
+    /// to a plain client and lets the system resolver try — never fail the
+    /// fetch just because our own resolution failed.
     pub async fn fetch_or_cached(
         &mut self,
         url: &str,
         interval_secs: u64,
         cache_path: &str,
+        upstream: &Upstream,
     ) -> Result<String, Box<dyn Error>> {
         // Check cache freshness — body must exist on disk
         if let Some(body) = self.get_if_fresh(url, interval_secs, cache_path) {
             return Ok(body);
         }
 
-        // Try to fetch fresh
-        let client = reqwest::Client::new();
+        // Try to fetch fresh.
+        //
+        // NOTE: one client per URL is intentional, not a missed optimization.
+        // The resolve() override is per-client and per-host, so sharing a
+        // single client across lists would silently drop the per-host pinning.
+        let client = client_for_url(url, upstream).await;
         let mut request = client.get(url);
 
         // Conditional GET: send If-None-Match if we have an etag
