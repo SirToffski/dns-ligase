@@ -138,27 +138,49 @@ impl Upstream {
 
     /// Forward a query over TCP and return the full response.
     /// On timeout or I/O error the connection is discarded (never returned).
+    /// A pooled connection that died while idle is retried once on a fresh
+    /// connection instead of failing the query.
     pub async fn tcp_query(&self, query: &[u8]) -> io::Result<Vec<u8>> {
-        let stream = match self.tcp_pool.lock().await.pop_back() {
-            Some(s) => s,
-            None => timeout(UPSTREAM_TIMEOUT, TcpStream::connect(self.addr))
-                .await
-                .map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "Upstream TCP connect timeout",
-                    )
-                })??,
-        };
+        // NOTE: the pop is a separate statement on purpose. A
+        // `if let Some(..) = self.tcp_pool.lock().await.pop_back()` scrutinee
+        // would keep the MutexGuard alive for the whole if-let body and
+        // deadlock in return_tcp() below (tokio Mutexes are not reentrant).
+        let pooled = self.tcp_pool.lock().await.pop_back();
+        if let Some(pooled) = pooled {
+            match Self::tcp_query_on(pooled, query).await {
+                Ok((stream, bytes)) => {
+                    self.return_tcp(stream).await;
+                    return Ok(bytes);
+                }
+                Err(e) => {
+                    log::debug!(
+                        "Pooled upstream TCP connection failed ({e}); retrying on a fresh one"
+                    );
+                }
+            }
+        }
+        let stream = timeout(UPSTREAM_TIMEOUT, TcpStream::connect(self.addr))
+            .await
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "Upstream TCP connect timeout",
+                )
+            })??;
         match Self::tcp_query_on(stream, query).await {
             Ok((stream, bytes)) => {
-                let mut pool = self.tcp_pool.lock().await;
-                if pool.len() < TCP_POOL_CAP {
-                    pool.push_back(stream);
-                }
+                self.return_tcp(stream).await;
                 Ok(bytes)
             }
             Err(e) => Err(e),
+        }
+    }
+
+    /// Return a healthy stream to the pool if there is room, else let it drop.
+    async fn return_tcp(&self, stream: TcpStream) {
+        let mut pool = self.tcp_pool.lock().await;
+        if pool.len() < TCP_POOL_CAP {
+            pool.push_back(stream);
         }
     }
 
@@ -259,7 +281,9 @@ impl UdpForwarder {
                     }
                     Err(e) => {
                         log::error!("UDP recv error: {}", e);
-                        break;
+                        // Transient (e.g. resource pressure) — stay alive. A
+                        // short nap avoids a hot spin if the error persists.
+                        tokio::time::sleep(Duration::from_millis(100)).await;
                     }
                 }
             }
@@ -271,7 +295,15 @@ impl UdpForwarder {
         let blocklist_tcp = Arc::clone(&self.blocklist);
         let log_tcp = Arc::clone(&self.log_queries);
         tasks.push(tokio::spawn(async move {
-            let listener = TcpListener::bind(&listen_addr_tcp).await.unwrap();
+            let listener = match TcpListener::bind(&listen_addr_tcp).await {
+                Ok(l) => l,
+                Err(e) => {
+                    // Fail loud: a half-dead process (UDP up, TCP down) looks
+                    // healthy to systemd. Exiting lets the unit restart us.
+                    log::error!("TCP bind on {listen_addr_tcp} failed: {e}; exiting");
+                    std::process::exit(1);
+                }
+            };
             loop {
                 if let Ok((mut stream, addr)) = listener.accept().await {
                     let upstream_ref = Arc::clone(&upstream_tcp);
@@ -598,11 +630,18 @@ fn build_nxdomain(msg: &DnsMessage) -> io::Result<Vec<u8>> {
 }
 
 /// Write a DNS message to a TCP stream with the 2-byte length prefix.
+/// Bounded by a timeout so a stalled client can't park its handler task forever.
 async fn write_tcp_message(stream: &mut TcpStream, msg: &[u8]) -> io::Result<()> {
     let len_buf = (msg.len() as u16).to_be_bytes();
-    stream.write_all(&len_buf).await?;
-    stream.write_all(msg).await?;
-    stream.flush().await?;
+    timeout(UPSTREAM_TIMEOUT, stream.write_all(&len_buf))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Client TCP write timeout"))??;
+    timeout(UPSTREAM_TIMEOUT, stream.write_all(msg))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Client TCP write timeout"))??;
+    timeout(UPSTREAM_TIMEOUT, stream.flush())
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Client TCP write timeout"))??;
     Ok(())
 }
 
@@ -764,6 +803,91 @@ mod tests {
         // The pool should have reused the same connection: exactly one accept.
         let n = *accepted.lock().await;
         assert_eq!(n, 1, "second query must reuse the pooled connection");
+    }
+
+    #[tokio::test]
+    async fn test_tcp_pool_dead_connection_retries_once() {
+        // The first connection serves exactly one query and is then dropped,
+        // simulating an upstream that closed an idle pooled connection. The
+        // next checkout must transparently retry on a fresh connection.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = listener.local_addr().unwrap();
+
+        let accepted = Arc::new(Mutex::new(0u32));
+        let accepted_clone = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            loop {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    let mut n = accepted_clone.lock().await;
+                    *n += 1;
+                    let which = *n;
+                    drop(n);
+                    if which == 1 {
+                        // Serve one query, then close: the pooled connection
+                        // is dead by the time it is checked out again.
+                        tokio::spawn(async move {
+                            let mut len_buf = [0u8; 2];
+                            if stream.read_exact(&mut len_buf).await.is_err() {
+                                return;
+                            }
+                            let len = u16::from_be_bytes(len_buf) as usize;
+                            let mut req = vec![0u8; len];
+                            if stream.read_exact(&mut req).await.is_err() {
+                                return;
+                            }
+                            let mut resp = req;
+                            resp[2] = 0x81;
+                            resp[3] = 0x80;
+                            let l = (resp.len() as u16).to_be_bytes();
+                            let _ = stream.write_all(&l).await;
+                            let _ = stream.write_all(&resp).await;
+                            let _ = stream.flush().await;
+                            // Fall off the end: connection closed while pooled.
+                        });
+                        continue;
+                    }
+                    tokio::spawn(async move {
+                        loop {
+                            let mut len_buf = [0u8; 2];
+                            if stream.read_exact(&mut len_buf).await.is_err() {
+                                return;
+                            }
+                            let len = u16::from_be_bytes(len_buf) as usize;
+                            let mut req = vec![0u8; len];
+                            if stream.read_exact(&mut req).await.is_err() {
+                                return;
+                            }
+                            let mut resp = req;
+                            resp[2] = 0x81;
+                            resp[3] = 0x80;
+                            let l = (resp.len() as u16).to_be_bytes();
+                            if stream.write_all(&l).await.is_err() {
+                                return;
+                            }
+                            if stream.write_all(&resp).await.is_err() {
+                                return;
+                            }
+                            let _ = stream.flush().await;
+                        }
+                    });
+                }
+            }
+        });
+
+        let upstream = Upstream::new(upstream_addr);
+        let query = query_msg("example.com").serialize().unwrap();
+
+        // Seeds the pool with a connection the server is about to close.
+        let r1 = upstream.tcp_query(&query).await.unwrap();
+        assert_eq!(r1[2], 0x81);
+
+        // Checks out the dead pooled connection; must retry on a fresh one.
+        let r2 = upstream.tcp_query(&query).await.unwrap();
+        assert_eq!(&r2[..2], &query[..2]);
+        assert_eq!(r2[2], 0x81);
+
+        let n = *accepted.lock().await;
+        assert_eq!(n, 2, "dead pooled connection must be retried once on fresh");
     }
 
     // --- CNAME filtering tests ---

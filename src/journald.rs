@@ -36,7 +36,17 @@ pub fn log_query(
     action: &str,
     rule: &str,
 ) {
-    let priority = match action {
+    // The native protocol frames fields with newlines, but DNS labels may
+    // legally contain 0x0A/0x0D bytes — a crafted QNAME could otherwise inject
+    // forged journal fields. ('=' inside a value is harmless: only the first
+    // '=' separates key from value.)
+    let source = sanitize_field(source);
+    let domain = sanitize_field(domain);
+    let qtype = sanitize_field(qtype);
+    let action = sanitize_field(action);
+    let rule = sanitize_field(rule);
+
+    let priority = match action.as_str() {
         "blocked" => 6, // LOG_INFO
         "allowed" => 7, // LOG_DEBUG
         _ => 6,
@@ -77,6 +87,16 @@ fn send(entry: &str) -> io::Result<()> {
     }
 }
 
+/// Strip newline bytes from a journal field value so untrusted input (e.g. a
+/// QNAME containing 0x0A) cannot forge journal protocol framing.
+fn sanitize_field(s: &str) -> String {
+    if s.bytes().any(|b| b == b'\n' || b == b'\r') {
+        s.replace(['\n', '\r'], "_")
+    } else {
+        s.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -87,5 +107,17 @@ mod tests {
         // silently fail rather than panic.
         log_query("192.168.1.5", "ads.example.com", "A", "blocked", "||ads.example.com^");
         log_query("10.0.0.1", "example.com", "AAAA", "allowed", "");
+        // A QNAME carrying newline bytes must not panic either.
+        log_query("10.0.0.2", "evil\nQUERY_ACTION=allowed", "A", "blocked", "x\ny");
+    }
+
+    #[test]
+    fn test_sanitize_field() {
+        assert_eq!(sanitize_field("ads.example.com"), "ads.example.com");
+        assert_eq!(sanitize_field("a\nb"), "a_b");
+        assert_eq!(sanitize_field("a\rb"), "a_b");
+        assert_eq!(sanitize_field("a\nQUERY_ACTION=x\nb"), "a_QUERY_ACTION=x_b");
+        // '=' is harmless to the protocol and must survive (rules contain it).
+        assert_eq!(sanitize_field("a=b"), "a=b");
     }
 }

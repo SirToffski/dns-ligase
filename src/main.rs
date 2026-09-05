@@ -192,36 +192,44 @@ async fn create_blocklist(config: &Config, cache: &Mutex<CachedLists>, cache_pat
         }
     }
 
-    // 2. Fetch each blocklist URL (cached or fresh), merge into final
+    // 2. Fetch all list URLs concurrently (block + allow), then merge.
+    // Lock discipline: the cache lock is held only for the sync plan and
+    // merge phases, never across network I/O.
     let cache_ttl = config.blocklists.cache_ttl_secs.unwrap_or(config.blocklists.refresh_interval_secs);
     let urls = config.blocklists.urls.clone();
+    let allow_urls = config.blocklists.allowlist_urls.clone();
+    let mut all_urls = urls.clone();
+    all_urls.extend(allow_urls.iter().cloned());
+    for url in &all_urls {
+        log::info!("Fetching list: {}", url);
+    }
+    let (fresh, jobs) = {
+        cache.lock().await.plan_fetches(&all_urls, cache_ttl, cache_path)
+    };
+    let downloaded = CachedLists::download_jobs(jobs, cache_path, upstream).await;
+    let merged = {
+        cache.lock().await.merge_downloads(downloaded, cache_path)
+    };
+    let mut bodies: std::collections::HashMap<String, String> =
+        fresh.into_iter().collect();
+    bodies.extend(merged);
+
     for url in &urls {
-        log::info!("Fetching blocklist: {}", url);
-        let mut c = cache.lock().await;
-        match c.fetch_or_cached(url, cache_ttl, cache_path, upstream).await {
-            Ok(body) => {
+        match bodies.get(url) {
+            Some(body) => {
                 log::info!("Blocklist fetched: {}", url);
-                parse_lines_into(&mut bl, &body);
+                parse_lines_into(&mut bl, body);
             }
-            Err(e) => {
-                log::warn!("Fetch failed for {}, using cached: {}", url, e);
-            }
+            None => log::warn!("Blocklist {url} has no usable copy; skipping"),
         }
     }
-
-    // 2b. Fetch each allowlist URL (cached or fresh), merge as allow rules
-    let allow_urls = config.blocklists.allowlist_urls.clone();
     for url in &allow_urls {
-        log::info!("Fetching allowlist: {}", url);
-        let mut c = cache.lock().await;
-        match c.fetch_or_cached(url, cache_ttl, cache_path, upstream).await {
-            Ok(body) => {
+        match bodies.get(url) {
+            Some(body) => {
                 log::info!("Allowlist fetched: {}", url);
-                parse_lines_into_allow(&mut bl, &body);
+                parse_lines_into_allow(&mut bl, body);
             }
-            Err(e) => {
-                log::warn!("Fetch failed for allowlist {}, using cached: {}", url, e);
-            }
+            None => log::warn!("Allowlist {url} has no usable copy; skipping"),
         }
     }
 
@@ -415,6 +423,23 @@ fn spawn_sighup_handler(
                         }
                     }
 
+                    // Validate the new upstream address BEFORE swapping anything
+                    // in: a bad value rejects the whole reload, leaving the old
+                    // config, pool, and blocklist untouched.
+                    let new_upstream_addr: std::net::SocketAddr = match format!(
+                        "{}:{}",
+                        new_config.upstream.address,
+                        new_config.upstream.port
+                    )
+                    .parse()
+                    {
+                        Ok(a) => a,
+                        Err(e) => {
+                            log::error!("Reloaded config has bad upstream, ignoring reload: {e}");
+                            continue;
+                        }
+                    };
+
                     // Update config atomically
                     *config.write().await = new_config;
 
@@ -427,16 +452,6 @@ fn spawn_sighup_handler(
                     // If the upstream address/port changed, swap in a fresh
                     // connection pool. In-flight queries holding the old Arc
                     // finish against the old address; new queries use the new.
-                    let new_upstream_addr: std::net::SocketAddr = {
-                        let cfg = config.read().await;
-                        match format!("{}:{}", cfg.upstream.address, cfg.upstream.port).parse() {
-                            Ok(a) => a,
-                            Err(e) => {
-                                log::error!("Bad upstream after reload, keeping old pool: {}", e);
-                                continue;
-                            }
-                        }
-                    };
                     {
                         let current = upstream.read().await.clone();
                         if current.addr() != new_upstream_addr {

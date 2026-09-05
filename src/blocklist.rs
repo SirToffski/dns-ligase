@@ -75,8 +75,14 @@ impl Blocklist {
                 };
 
                 if pattern_part.starts_with("||") {
+                    // AdBlock options (`$third-party`, `$important`, ...) are
+                    // content-type modifiers, not part of the domain. Without
+                    // stripping them the entry can never match a query name.
                     let domain = pattern_part
                         .trim_start_matches("||")
+                        .split('$')
+                        .next()
+                        .unwrap_or("")
                         .trim_end_matches('^')
                         .trim_end_matches('.')
                         .to_lowercase();
@@ -157,6 +163,17 @@ impl Blocklist {
     }
 
     fn clean_domain_static(domain: &str) -> Option<String> {
+        // AdBlock/uBO cosmetic and scriptlet rules (##, #$#, #@#, #?#) are not
+        // DNS rules. Without this guard a line like `example.com##.ad` would be
+        // truncated at '#' below and misparsed as a bare-domain block for the
+        // whole domain. A hosts file never legitimately contains these markers.
+        if domain.contains("##")
+            || domain.contains("#$#")
+            || domain.contains("#@#")
+            || domain.contains("#?#")
+        {
+            return None;
+        }
         let domain = domain.split('#').next()?.trim();
         if domain.is_empty() {
             return None;
@@ -171,10 +188,19 @@ impl Blocklist {
 
         let cleaned = target.trim_end_matches('.');
         if cleaned.is_empty() {
-            None
-        } else {
-            Some(cleaned.to_string())
+            return None;
         }
+        // Never block local names commonly present in hosts files (e.g. the
+        // `127.0.0.1 localhost` lines in StevenBlack). Blocking them would
+        // NXDOMAIN local resolution for the whole LAN.
+        if cleaned.eq_ignore_ascii_case("localhost")
+            || cleaned.eq_ignore_ascii_case("localhost.localdomain")
+            || cleaned.eq_ignore_ascii_case("broadcasthost")
+            || cleaned.eq_ignore_ascii_case("local")
+        {
+            return None;
+        }
+        Some(cleaned.to_string())
     }
 
     #[allow(dead_code)]
@@ -185,27 +211,35 @@ impl Blocklist {
     /// Check a domain and return the outcome with the matched rule, if any.
     /// Only allocates the rule description string when a rule actually matches.
     pub fn check(&self, domain: &str) -> MatchOutcome {
-        let domain_lower = domain.to_lowercase();
+        // Fast path: query names are almost always already lowercase — borrow
+        // the input as-is and only allocate when an uppercase byte is present.
+        let lowered;
+        let domain_lower: &str = if domain.bytes().any(|b| b.is_ascii_uppercase()) {
+            lowered = domain.to_lowercase();
+            &lowered
+        } else {
+            domain
+        };
         // Allow takes precedence over block
-        if self.allow_domains.contains(&domain_lower) {
+        if self.allow_domains.contains(domain_lower) {
             return MatchOutcome::Allowed(format!("allow:{}", domain_lower));
         }
         for re in &self.allow_regex {
-            if re.is_match(&domain_lower) {
+            if re.is_match(domain_lower) {
                 return MatchOutcome::Allowed(format!("allow_regex:{}", re.as_str()));
             }
         }
-        if Self::suffix_match(&self.allow_suffixes, &domain_lower) {
+        if Self::suffix_match(&self.allow_suffixes, domain_lower) {
             return MatchOutcome::Allowed(format!("allow_suffix:{}", domain_lower));
         }
-        if self.block_domains.contains(&domain_lower) {
+        if self.block_domains.contains(domain_lower) {
             return MatchOutcome::Blocked(format!("block:{}", domain_lower));
         }
-        if Self::suffix_match(&self.block_suffixes, &domain_lower) {
+        if Self::suffix_match(&self.block_suffixes, domain_lower) {
             return MatchOutcome::Blocked(format!("block_suffix:{}", domain_lower));
         }
         for re in &self.block_regex {
-            if re.is_match(&domain_lower) {
+            if re.is_match(domain_lower) {
                 return MatchOutcome::Blocked(format!("block_regex:{}", re.as_str()));
             }
         }
@@ -374,6 +408,102 @@ async fn client_for_url(url_str: &str, upstream: &Upstream) -> reqwest::Client {
         })
 }
 
+/// Read a cached body file from disk. Free function so the download phase can
+/// use it without holding the cache lock.
+fn read_body_file(cache_path: &str, filename: &str) -> Option<String> {
+    fs::read_to_string(bodies_dir(cache_path).join(filename)).ok()
+}
+
+/// Grouping key for sharing HTTP clients: lowercase hostname, or the full URL
+/// when it has none (unparseable URLs each get their own fallback client).
+fn client_key(url_str: &str) -> String {
+    url::Url::parse(url_str)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_lowercase()))
+        .unwrap_or_else(|| url_str.to_string())
+}
+
+/// One URL needing a download, with its stored etag for a conditional GET.
+pub struct FetchJob {
+    pub url: String,
+    pub etag: Option<String>,
+}
+
+/// Outcome of downloading one URL. Carries everything phase 3 needs without
+/// further I/O.
+pub enum DownloadResult {
+    /// New content: persist the body file and metadata.
+    Fresh { body: String, etag: Option<String> },
+    /// Body served from the on-disk file (304 or error fallback): nothing to persist.
+    FromDisk(String),
+    /// No body available (error message for the warning log).
+    Failed(String),
+}
+
+fn resp_etag(resp: &reqwest::Response) -> Option<String> {
+    resp.headers()
+        .get(reqwest::header::ETAG)
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string())
+}
+
+/// Download one list body with a conditional GET. Disk reads only (body-file
+/// fallback); never touches cache metadata, so it runs without the cache lock.
+/// Semantics match the old sequential fetcher: 304 keeps the existing entry,
+/// any failure falls back to the on-disk copy when present.
+async fn download_one(
+    url: &str,
+    etag: Option<&str>,
+    client: &reqwest::Client,
+    cache_path: &str,
+) -> DownloadResult {
+    let mut request = client.get(url);
+    if let Some(etag) = etag {
+        request = request.header(reqwest::header::IF_NONE_MATCH, etag);
+    }
+    let filename = url_to_filename(url);
+    let read_cached = || read_body_file(cache_path, &filename);
+
+    let resp = match request.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            return read_cached()
+                .map(DownloadResult::FromDisk)
+                .unwrap_or_else(|| DownloadResult::Failed(format!("request failed: {e}")));
+        }
+    };
+    match resp.status() {
+        reqwest::StatusCode::NOT_MODIFIED => {
+            if let Some(body) = read_cached() {
+                DownloadResult::FromDisk(body)
+            } else {
+                // Body file missing despite a 304 — do a full unconditional GET.
+                log::warn!("304 for {url} but body file missing; refetching");
+                match client.get(url).send().await {
+                    Ok(r) => {
+                        let new_etag = resp_etag(&r);
+                        match r.text().await {
+                            Ok(body) => DownloadResult::Fresh { body, etag: new_etag },
+                            Err(e) => DownloadResult::Failed(format!("read body: {e}")),
+                        }
+                    }
+                    Err(e) => DownloadResult::Failed(format!("refetch failed: {e}")),
+                }
+            }
+        }
+        reqwest::StatusCode::OK => {
+            let new_etag = resp_etag(&resp);
+            match resp.text().await {
+                Ok(body) => DownloadResult::Fresh { body, etag: new_etag },
+                Err(e) => DownloadResult::Failed(format!("read body: {e}")),
+            }
+        }
+        status => read_cached()
+            .map(DownloadResult::FromDisk)
+            .unwrap_or_else(|| DownloadResult::Failed(format!("HTTP {status}"))),
+    }
+}
+
 impl CachedLists {
     #[allow(dead_code)]
     pub fn new() -> Self {
@@ -383,8 +513,7 @@ impl CachedLists {
     /// Read a cached body from disk. Returns None if the file is missing or
     /// unreadable — caller should treat the entry as stale.
     fn read_body(&self, cache_path: &str, filename: &str) -> Option<String> {
-        let path = bodies_dir(cache_path).join(filename);
-        fs::read_to_string(&path).ok()
+        read_body_file(cache_path, filename)
     }
 
     /// Write a body to disk. Creates the bodies directory if needed.
@@ -413,119 +542,109 @@ impl CachedLists {
         })
     }
 
-    /// Fetch a URL. If cached and fresh, read the body from disk and return it.
-    /// Otherwise fetch fresh; on failure, read the body from disk if available.
-    ///
-    /// The list hostname is resolved through our own `upstream` first so the
-    /// service doesn't depend on the system resolver (which may itself point
-    /// at dns-ligase). If our resolution fails or yields nothing, falls back
-    /// to a plain client and lets the system resolver try — never fail the
-    /// fetch just because our own resolution failed.
-    pub async fn fetch_or_cached(
-        &mut self,
-        url: &str,
+    /// Phase 1 (sync — call under a brief lock): split URLs into fresh cached
+    /// bodies vs. jobs needing a download. No network, only small disk reads.
+    pub fn plan_fetches(
+        &self,
+        urls: &[String],
         interval_secs: u64,
         cache_path: &str,
+    ) -> (Vec<(String, String)>, Vec<FetchJob>) {
+        let mut fresh = Vec::new();
+        let mut jobs = Vec::new();
+        for url in urls {
+            if let Some(body) = self.get_if_fresh(url, interval_secs, cache_path) {
+                fresh.push((url.clone(), body));
+            } else {
+                jobs.push(FetchJob {
+                    url: url.clone(),
+                    etag: self.map.get(url).and_then(|c| c.etag.clone()),
+                });
+            }
+        }
+        (fresh, jobs)
+    }
+
+    /// Phase 2 (async — call WITHOUT holding the cache lock): download all
+    /// jobs concurrently via a JoinSet. One HTTP client is built per distinct
+    /// hostname (the resolve override is per-client per-host, so same-host
+    /// URLs share a client while different hosts stay pinned correctly) —
+    /// which also means one upstream resolve per host instead of per URL.
+    pub async fn download_jobs(
+        jobs: Vec<FetchJob>,
+        cache_path: &str,
         upstream: &Upstream,
-    ) -> Result<String, Box<dyn Error>> {
-        // Check cache freshness — body must exist on disk
-        if let Some(body) = self.get_if_fresh(url, interval_secs, cache_path) {
-            return Ok(body);
+    ) -> Vec<(String, DownloadResult)> {
+        // Group job indices by hostname so same-host URLs share a client.
+        let mut by_host: HashMap<String, Vec<usize>> = HashMap::new();
+        for (i, job) in jobs.iter().enumerate() {
+            by_host.entry(client_key(&job.url)).or_default().push(i);
+        }
+        let mut clients: HashMap<String, reqwest::Client> = HashMap::new();
+        for (host, idxs) in &by_host {
+            let url = &jobs[idxs[0]].url;
+            clients.insert(host.clone(), client_for_url(url, upstream).await);
         }
 
-        // Try to fetch fresh.
-        //
-        // NOTE: one client per URL is intentional, not a missed optimization.
-        // The resolve() override is per-client and per-host, so sharing a
-        // single client across lists would silently drop the per-host pinning.
-        let client = client_for_url(url, upstream).await;
-        let mut request = client.get(url);
-
-        // Conditional GET: send If-None-Match if we have an etag
-        if let Some(ref etag) = self.map.get(url).and_then(|c| c.etag.clone()) {
-            request = request.header(reqwest::header::IF_NONE_MATCH, etag);
+        let cache_path = cache_path.to_string();
+        let mut set = tokio::task::JoinSet::new();
+        for job in jobs {
+            let client = clients
+                .get(&client_key(&job.url))
+                .cloned()
+                .unwrap_or_else(reqwest::Client::new);
+            let cp = cache_path.clone();
+            set.spawn(async move {
+                let FetchJob { url, etag } = job;
+                let res = download_one(&url, etag.as_deref(), &client, &cp).await;
+                (url, res)
+            });
         }
-
-        let resp = match request.send().await {
-            Ok(r) => r,
-            Err(e) => {
-                // Network failure — fall back to cached body file if available
-                if let Some(cached) = self.map.get(url) {
-                    if let Some(body) = self.read_body(cache_path, &cached.filename) {
-                        log::warn!("Fetch failed for {url} ({e}); using cached copy");
-                        return Ok(body);
-                    }
-                }
-                return Err(e.into());
-            }
-        };
-
-        match resp.status() {
-            reqwest::StatusCode::NOT_MODIFIED => {
-                // Not modified — keep existing cache entry, read body from disk
-                if let Some(cached) = self.map.get(url) {
-                    if let Some(body) = self.read_body(cache_path, &cached.filename) {
-                        return Ok(body);
-                    }
-                }
-                // Body file missing despite a 304 — fall through to a full GET
-                log::warn!("304 for {url} but body file missing; refetching");
-                let resp2 = client.get(url).send().await?;
-                let new_etag = resp2
-                    .headers()
-                    .get(reqwest::header::ETAG)
-                    .and_then(|h| h.to_str().ok())
-                    .map(|s| s.to_string());
-                let body = resp2.text().await?;
-                let filename = url_to_filename(url);
-                self.write_body(cache_path, &filename, &body)?;
-                let now = SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                self.map.insert(url.to_string(), CachedList {
-                    fetched_at: now,
-                    etag: new_etag,
-                    filename,
-                });
-                self.dirty = true;
-                Ok(body)
-            }
-            reqwest::StatusCode::OK => {
-                let new_etag = resp
-                    .headers()
-                    .get(reqwest::header::ETAG)
-                    .and_then(|h| h.to_str().ok())
-                    .map(|s| s.to_string());
-                let body = resp.text().await?;
-
-                let filename = url_to_filename(url);
-                self.write_body(cache_path, &filename, &body)?;
-
-                let now = SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-
-                self.map.insert(url.to_string(), CachedList {
-                    fetched_at: now,
-                    etag: new_etag,
-                    filename,
-                });
-                self.dirty = true;
-                Ok(body)
-            }
-            _ => {
-                // HTTP error (4xx/5xx) — fall back to cached body file if available
-                if let Some(cached) = self.map.get(url) {
-                    if let Some(body) = self.read_body(cache_path, &cached.filename) {
-                        log::warn!("Fetch returned {} for {}; using cached copy", resp.status(), url);
-                        return Ok(body);
-                    }
-                }
-                Err(io::Error::other(format!("HTTP {}", resp.status())).into())
+        let mut out = Vec::new();
+        while let Some(joined) = set.join_next().await {
+            match joined {
+                Ok(pair) => out.push(pair),
+                Err(e) => log::error!("List download task failed: {e}"),
             }
         }
+        out
+    }
+
+    /// Phase 3 (sync — call under a brief lock): persist fresh downloads and
+    /// return every usable (url, body), from disk or network. Logs failures.
+    pub fn merge_downloads(
+        &mut self,
+        results: Vec<(String, DownloadResult)>,
+        cache_path: &str,
+    ) -> Vec<(String, String)> {
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut bodies = Vec::new();
+        for (url, res) in results {
+            match res {
+                DownloadResult::Fresh { body, etag } => {
+                    let filename = url_to_filename(&url);
+                    if let Err(e) = self.write_body(cache_path, &filename, &body) {
+                        log::error!("Failed to write cached body for {url}: {e}");
+                        continue;
+                    }
+                    self.map.insert(url.clone(), CachedList {
+                        fetched_at: now,
+                        etag,
+                        filename,
+                    });
+                    self.dirty = true;
+                    bodies.push((url, body));
+                }
+                DownloadResult::FromDisk(body) => bodies.push((url, body)),
+                DownloadResult::Failed(err) => {
+                    log::warn!("Fetch failed for {url}, no cached copy: {err}");
+                }
+            }
+        }
+        bodies
     }
 
     /// Remove cache entries whose URLs are no longer in the config.
@@ -738,6 +857,148 @@ mod tests {
         assert!(!bl.matches("allow.me"), "regex in allowlist should allow");
         assert!(!bl.matches("redundant.ads.com"), "@@ in allowlist is still allow");
         assert!(bl.matches("evil.ads.com"), "block still applies");
+    }
+
+    #[test]
+    fn test_localhost_names_never_blocked() {
+        let mut bl = Blocklist::new();
+        // As found in StevenBlack/hosts headers.
+        bl.parse_auto("127.0.0.1 localhost").unwrap();
+        bl.parse_auto("127.0.0.1 localhost.localdomain").unwrap();
+        bl.parse_auto("255.255.255.255 broadcasthost").unwrap();
+        bl.parse_auto("::1 localhost").unwrap();
+        bl.parse_auto("local").unwrap();
+        assert!(!bl.matches("localhost"));
+        assert!(!bl.matches("localhost.localdomain"));
+        assert!(!bl.matches("broadcasthost"));
+        assert!(!bl.matches("local"));
+        // ...while real entries from the same file still block.
+        bl.parse_auto("0.0.0.0 ads.example.com").unwrap();
+        assert!(bl.matches("ads.example.com"));
+    }
+
+    #[test]
+    fn test_adblock_options_stripped() {
+        let mut bl = Blocklist::new();
+        bl.parse_auto("||ads.example.co^$important").unwrap();
+        bl.parse_auto("||tracker.example.net^$third-party").unwrap();
+        assert!(bl.matches("ads.example.co"));
+        assert!(bl.matches("sub.ads.example.co"));
+        assert!(bl.matches("tracker.example.net"));
+        assert!(!bl.matches("example.com"));
+    }
+
+    #[test]
+    fn test_cosmetic_rules_ignored() {
+        let mut bl = Blocklist::new();
+        bl.parse_auto("example.com##.ad-banner").unwrap();
+        bl.parse_auto("##.global-ad").unwrap();
+        bl.parse_auto("example.com#$#abort-on-property-read.js").unwrap();
+        assert!(
+            !bl.matches("example.com"),
+            "cosmetic rules must not block the page domain"
+        );
+    }
+
+    #[test]
+    fn test_check_uppercase_query_matches() {
+        // Exercises both branches of the lowercase fast-path in check().
+        let mut bl = Blocklist::new();
+        bl.parse_auto("||ads.com^").unwrap();
+        assert!(bl.matches("ADS.COM"));
+        assert!(bl.matches("Sub.Ads.Com"));
+        assert!(!bl.matches("GOOGLE.COM"));
+    }
+
+    #[test]
+    fn test_client_key_groups_by_host() {
+        assert_eq!(
+            client_key("https://example.com/a.txt"),
+            client_key("https://example.com/other/path.txt")
+        );
+        assert_eq!(client_key("https://example.com/a.txt"), "example.com");
+        assert_eq!(client_key("https://EXAMPLE.com/a.txt"), "example.com");
+        assert_ne!(
+            client_key("https://a.example.com/l.txt"),
+            client_key("https://b.example.com/l.txt")
+        );
+        // Unparseable URLs key on themselves (own fallback client each).
+        assert_eq!(client_key("not a url %%"), "not a url %%");
+    }
+
+    #[test]
+    fn test_plan_and_merge_round_trip() {
+        let dir = std::env::temp_dir().join("dns-ligase-test-plan-merge");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache_path = dir.join("cache.json");
+        let path_str = cache_path.to_str().unwrap();
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let mut cache = CachedLists::default();
+        // Fresh entry with body on disk.
+        let fresh_url = "https://example.com/fresh.txt";
+        let fresh_fn = url_to_filename(fresh_url);
+        cache.write_body(path_str, &fresh_fn, "fresh-body\n").unwrap();
+        cache.map.insert(fresh_url.to_string(), CachedList {
+            fetched_at: now,
+            etag: Some("\"f\"".to_string()),
+            filename: fresh_fn,
+        });
+        // Stale entry with body on disk and an etag for conditional GET.
+        let stale_url = "https://example.com/stale.txt";
+        let stale_fn = url_to_filename(stale_url);
+        cache.write_body(path_str, &stale_fn, "stale-body\n").unwrap();
+        cache.map.insert(stale_url.to_string(), CachedList {
+            fetched_at: now.saturating_sub(7200),
+            etag: Some("\"s\"".to_string()),
+            filename: stale_fn,
+        });
+
+        let new_url = "https://new.example/x.txt";
+        let (fresh, jobs) = cache.plan_fetches(
+            &[fresh_url.to_string(), stale_url.to_string(), new_url.to_string()],
+            3600,
+            path_str,
+        );
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].0, fresh_url);
+        assert_eq!(fresh[0].1, "fresh-body\n");
+        assert_eq!(jobs.len(), 2);
+        let stale_job = jobs.iter().find(|j| j.url == stale_url).unwrap();
+        assert_eq!(stale_job.etag.as_deref(), Some("\"s\""));
+        let new_job = jobs.iter().find(|j| j.url == new_url).unwrap();
+        assert_eq!(new_job.etag, None);
+
+        // Merge: one fresh download, one disk reuse, one failure.
+        let merged = cache.merge_downloads(
+            vec![
+                (new_url.to_string(), DownloadResult::Fresh {
+                    body: "new-body\n".to_string(),
+                    etag: None,
+                }),
+                (stale_url.to_string(), DownloadResult::FromDisk("stale-body\n".to_string())),
+                ("https://dead.example/y.txt".to_string(), DownloadResult::Failed("boom".to_string())),
+            ],
+            path_str,
+        );
+        assert_eq!(merged.len(), 2);
+        // Fresh download persisted to disk and metadata.
+        let entry = cache.map.get(new_url).unwrap();
+        assert_eq!(
+            cache.read_body(path_str, &entry.filename).as_deref(),
+            Some("new-body\n")
+        );
+        // Disk reuse leaves existing metadata untouched (304 semantics).
+        assert_eq!(
+            cache.map.get(stale_url).unwrap().etag.as_deref(),
+            Some("\"s\"")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // --- Cache body-on-disk tests ---
