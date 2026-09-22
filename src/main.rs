@@ -9,7 +9,7 @@ mod stats;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use crate::blocklist::{
-    parse_lines_into, parse_lines_into_allow, Blocklist, CachedLists,
+    parse_lines_into, parse_lines_into_allow, parse_lines_into_regex, Blocklist, CachedLists,
 };
 use crate::config::Config;
 use crate::upstream::{Upstream, UdpForwarder, UpstreamHandle};
@@ -198,8 +198,12 @@ async fn create_blocklist(config: &Config, cache: &Mutex<CachedLists>, cache_pat
     let cache_ttl = config.blocklists.cache_ttl_secs.unwrap_or(config.blocklists.refresh_interval_secs);
     let urls = config.blocklists.urls.clone();
     let allow_urls = config.blocklists.allowlist_urls.clone();
+    let regex_block_urls = config.blocklists.regex_block_urls.clone();
+    let regex_allow_urls = config.blocklists.regex_allow_urls.clone();
     let mut all_urls = urls.clone();
     all_urls.extend(allow_urls.iter().cloned());
+    all_urls.extend(regex_block_urls.iter().cloned());
+    all_urls.extend(regex_allow_urls.iter().cloned());
     for url in &all_urls {
         log::info!("Fetching list: {}", url);
     }
@@ -232,6 +236,24 @@ async fn create_blocklist(config: &Config, cache: &Mutex<CachedLists>, cache_pat
             None => log::warn!("Allowlist {url} has no usable copy; skipping"),
         }
     }
+    for url in &regex_block_urls {
+        match bodies.get(url) {
+            Some(body) => {
+                log::info!("Regex blocklist fetched: {}", url);
+                parse_lines_into_regex(&mut bl, body, false);
+            }
+            None => log::warn!("Regex blocklist {url} has no usable copy; skipping"),
+        }
+    }
+    for url in &regex_allow_urls {
+        match bodies.get(url) {
+            Some(body) => {
+                log::info!("Regex allowlist fetched: {}", url);
+                parse_lines_into_regex(&mut bl, body, true);
+            }
+            None => log::warn!("Regex allowlist {url} has no usable copy; skipping"),
+        }
+    }
 
     log::info!(
         "Blocklist: {} block exact, {} block suffix, {} block regex, {} allow exact, {} allow suffix, {} allow regex",
@@ -242,6 +264,8 @@ async fn create_blocklist(config: &Config, cache: &Mutex<CachedLists>, cache_pat
     // 3. Prune stale entries and persist cache to disk
     let mut keep_urls = config.blocklists.urls.clone();
     keep_urls.extend(config.blocklists.allowlist_urls.iter().cloned());
+    keep_urls.extend(config.blocklists.regex_block_urls.iter().cloned());
+    keep_urls.extend(config.blocklists.regex_allow_urls.iter().cloned());
     {
         let mut c = cache.lock().await;
         c.prune(&keep_urls, cache_path);
@@ -358,6 +382,26 @@ fn spawn_sighup_handler(
                         }
                         for url in &old_allow - &new_allow {
                             log::info!("Allowlist removed: {}", url);
+                        }
+
+                        // Regex blocklist URLs
+                        let old_rb: HashSet<_> = old_config.blocklists.regex_block_urls.iter().collect();
+                        let new_rb: HashSet<_> = new_config.blocklists.regex_block_urls.iter().collect();
+                        for url in &new_rb - &old_rb {
+                            log::info!("Regex blocklist added: {}", url);
+                        }
+                        for url in &old_rb - &new_rb {
+                            log::info!("Regex blocklist removed: {}", url);
+                        }
+
+                        // Regex allowlist URLs
+                        let old_ra: HashSet<_> = old_config.blocklists.regex_allow_urls.iter().collect();
+                        let new_ra: HashSet<_> = new_config.blocklists.regex_allow_urls.iter().collect();
+                        for url in &new_ra - &old_ra {
+                            log::info!("Regex allowlist added: {}", url);
+                        }
+                        for url in &old_ra - &new_ra {
+                            log::info!("Regex allowlist removed: {}", url);
                         }
 
                         // Refresh interval

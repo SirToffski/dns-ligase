@@ -8,8 +8,7 @@ It is intended to sit in front of a local validating resolver (unbound) as a lig
 
 ## Why
 
-The goal was a resolver path made of parts I've actually read. AdGuard Home works fine, but it's a large third-party binary serving DNS for every device in the house, with a web server and update machinery attached. This does the
-one thing I need — filter, then forward — in a few thousand lines.
+The goal was a resolver path made of parts I've actually read. AdGuard Home works fine, but it's a large third-party binary serving DNS for every device in the house, with a web server and update machinery attached. This does the one thing I need — filter, then forward — in a few thousand lines.
 
 The DNS wire protocol is parsed by hand rather than pulled from a crate. That was the point of the exercise. Crates are used for the genuinely solved problems (TLS, regex, async runtime, allocation).
 
@@ -62,6 +61,7 @@ List refreshes fetch all URLs concurrently and never hold the cache lock across 
 - Format auto-detection per line; cosmetic/scriptlet rules (`##`, `#$#`, …) ignored rather than misparsed
 - Local names (`localhost`, `broadcasthost`, …) from hosts-file headers are never blocked
 - Manual block/allow entries and regex rules from config
+- Regex block/allow lists fetched from URLs (one pattern per line, Pi-hole style)
 - Allow rules take precedence over block rules
 - Responses are also scanned for CNAME-cloaked trackers: a blocked CNAME target means NXDOMAIN
 - Periodic background refresh with atomic swap
@@ -169,6 +169,15 @@ urls = [
 # rule, overriding block rules. Shares the same refresh interval and cache.
 # allowlist_urls = [
 #   "https://raw.githubusercontent.com/anudeepND/whitelist/master/domains/whitelist.txt",
+# ]
+# Optional: URLs fetched and parsed as regex rules, one pattern per line
+# (Pi-hole style, e.g. `(\.|^)ads\.example\.com$ -- comment`). Same formats
+# for trailers (` -- comment` suffixes and `/.../ ` wrapping are tolerated).
+# regex_block_urls = [
+#   "https://raw.githubusercontent.com/slyfox1186/pihole-regex/main/domains/regex-blacklist.sql",
+# ]
+# regex_allow_urls = [
+#   "https://raw.githubusercontent.com/slyfox1186/pihole-regex/main/domains/regex-whitelist.sql",
 # ]
 refresh_interval_secs = 3600
 # cache_ttl_secs = 3600    # optional; defaults to refresh_interval_secs

@@ -273,6 +273,44 @@ pub fn parse_lines_into_allow(bl: &mut Blocklist, body: &str) {
     }
 }
 
+/// Parse lines from a regex-list body, compiling every pattern into the block
+/// or allow regex set. Expected format is one pattern per line (as in Pi-hole
+/// regex lists), with optional ` -- comment` trailers and optional `/.../`
+/// wrapping. Uncompilable lines are skipped.
+pub fn parse_lines_into_regex(bl: &mut Blocklist, body: &str, as_allow: bool) {
+    for line in body.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with('!') || line.starts_with("--") {
+            continue;
+        }
+        // Pi-hole style trailing comment: `pattern -- description`. Split on
+        // ` -- ` (with spaces) — a literal space can never occur in a QNAME,
+        // so no workable pattern is harmed by this.
+        let pattern = line.split(" -- ").next().unwrap_or("").trim();
+        if pattern.is_empty() {
+            continue;
+        }
+        // Tolerate AdBlock-style /.../ wrapping.
+        let pattern = pattern
+            .strip_prefix('/')
+            .and_then(|s| s.strip_suffix('/'))
+            .unwrap_or(pattern);
+        if pattern.is_empty() {
+            continue;
+        }
+        match Regex::new(pattern) {
+            Ok(re) => {
+                if as_allow {
+                    bl.allow_regex.push(re);
+                } else {
+                    bl.block_regex.push(re);
+                }
+            }
+            Err(_) => continue, // skip uncompilable lines, like other parsers
+        }
+    }
+}
+
 /// Merge source blocklist into target.
 #[allow(dead_code)]
 pub fn merge_blocklist(target: &mut Blocklist, source: Blocklist) {
@@ -935,6 +973,44 @@ mod tests {
         assert!(bl.matches("ADS.COM"));
         assert!(bl.matches("Sub.Ads.Com"));
         assert!(!bl.matches("GOOGLE.COM"));
+    }
+
+    #[test]
+    fn test_parse_lines_into_regex_block() {
+        let mut bl = Blocklist::new();
+        // Pi-hole regex list shape: bare pattern + ` -- comment` trailer.
+        let body = "## placeholder comment\n\
+                    (\\.|^)ad-score\\.com$ -- Overwolf Desktop App\n\
+                    ^(.+[_.-])?adse?rv(er?|ice)?s?[0-9]*[_.-] -- mmotti RegEx\n\
+                    \n\
+                    # hash comment\n\
+                    ! bang comment\n\
+                    [invalid(regex -- skipped, must not poison the rest\n";
+        parse_lines_into_regex(&mut bl, body, false);
+        assert_eq!(bl.block_regex.len(), 2);
+        assert!(bl.matches("ad-score.com"));
+        assert!(bl.matches("eu.ad-score.com"));
+        assert!(bl.matches("adserver-1.example.com"));
+        assert!(!bl.matches("google.com"));
+    }
+
+    #[test]
+    fn test_parse_lines_into_regex_unwraps_slashes() {
+        let mut bl = Blocklist::new();
+        parse_lines_into_regex(&mut bl, "/^allow\\.me$/\n", true);
+        assert_eq!(bl.allow_regex.len(), 1);
+        // Allow-via-URL beats an exact block, like any other allow rule.
+        bl.parse_auto("allow.me").unwrap();
+        assert!(!bl.matches("allow.me"));
+    }
+
+    #[test]
+    fn test_parse_lines_into_regex_allow_only() {
+        let mut bl = Blocklist::new();
+        bl.parse_auto("||ads.com^").unwrap();
+        parse_lines_into_regex(&mut bl, "(\\.|^)safe\\.ads\\.com$ -- exception\n", true);
+        assert!(!bl.matches("safe.ads.com"));
+        assert!(bl.matches("evil.ads.com"));
     }
 
     #[test]
