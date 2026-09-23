@@ -148,18 +148,20 @@ impl Blocklist {
         Ok(())
     }
 
-    fn suffix_match(set: &HashSet<String>, domain: &str) -> bool {
-        if set.contains(domain) {
-            return true;
+    /// Suffix lookup returning the matched rule, so logs show which suffix
+    /// fired (e.g. `block_suffix:ads.com`) rather than the queried name.
+    fn suffix_match<'s>(set: &'s HashSet<String>, domain: &str) -> Option<&'s str> {
+        if let Some(hit) = set.get(domain) {
+            return Some(hit);
         }
         let mut rest = domain;
         while let Some(pos) = rest.find('.') {
             rest = &rest[pos + 1..];
-            if set.contains(rest) {
-                return true;
+            if let Some(hit) = set.get(rest) {
+                return Some(hit);
             }
         }
-        false
+        None
     }
 
     fn clean_domain_static(domain: &str) -> Option<String> {
@@ -229,14 +231,14 @@ impl Blocklist {
                 return MatchOutcome::Allowed(format!("allow_regex:{}", re.as_str()));
             }
         }
-        if Self::suffix_match(&self.allow_suffixes, domain_lower) {
-            return MatchOutcome::Allowed(format!("allow_suffix:{}", domain_lower));
+        if let Some(hit) = Self::suffix_match(&self.allow_suffixes, domain_lower) {
+            return MatchOutcome::Allowed(format!("allow_suffix:{hit}"));
         }
         if self.block_domains.contains(domain_lower) {
             return MatchOutcome::Blocked(format!("block:{}", domain_lower));
         }
-        if Self::suffix_match(&self.block_suffixes, domain_lower) {
-            return MatchOutcome::Blocked(format!("block_suffix:{}", domain_lower));
+        if let Some(hit) = Self::suffix_match(&self.block_suffixes, domain_lower) {
+            return MatchOutcome::Blocked(format!("block_suffix:{hit}"));
         }
         for re in &self.block_regex {
             if re.is_match(domain_lower) {
@@ -973,6 +975,26 @@ mod tests {
         assert!(bl.matches("ADS.COM"));
         assert!(bl.matches("Sub.Ads.Com"));
         assert!(!bl.matches("GOOGLE.COM"));
+    }
+
+    #[test]
+    fn test_suffix_hit_logs_matched_rule() {
+        let mut bl = Blocklist::new();
+        bl.parse_auto("||ads.com^").unwrap();
+        bl.parse_auto("@@||safe.ads.com^").unwrap();
+        // Logs name the rule that fired, not the queried name.
+        assert_eq!(
+            bl.check("sub.ads.com"),
+            MatchOutcome::Blocked("block_suffix:ads.com".to_string())
+        );
+        assert_eq!(
+            bl.check("ads.com"),
+            MatchOutcome::Blocked("block_suffix:ads.com".to_string())
+        );
+        assert_eq!(
+            bl.check("deep.safe.ads.com"),
+            MatchOutcome::Allowed("allow_suffix:safe.ads.com".to_string())
+        );
     }
 
     #[test]

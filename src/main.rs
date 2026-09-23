@@ -174,21 +174,27 @@ async fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
 async fn create_blocklist(config: &Config, cache: &Mutex<CachedLists>, cache_path: &str, upstream: &Upstream) -> Blocklist {
     let mut bl = Blocklist::new();
 
-    // 1. Apply manual rules
+    // 1. Apply manual rules. Config entries are hand-edited, so invalid
+    // patterns warn loudly instead of failing silent (unlike remote lists,
+    // where a bad line is skipped quietly because there is nothing to fix).
     for domain in &config.matching.manual_block {
-        let _ = bl.parse_line(domain, crate::blocklist::ListFormat::AdBlock);
+        if let Err(e) = bl.parse_line(domain, crate::blocklist::ListFormat::AdBlock) {
+            log::warn!("invalid manual_block entry {domain:?}: {e}");
+        }
     }
     for domain in &config.matching.manual_allow {
         bl.allow_domains.insert(domain.to_lowercase().trim_end_matches('.').to_string());
     }
     for pattern in &config.matching.regex_block {
-        if let Ok(re) = regex::Regex::new(pattern) {
-            bl.block_regex.push(re);
+        match regex::Regex::new(pattern) {
+            Ok(re) => bl.block_regex.push(re),
+            Err(e) => log::warn!("invalid regex_block pattern {pattern:?}: {e}"),
         }
     }
     for pattern in &config.matching.regex_allow {
-        if let Ok(re) = regex::Regex::new(pattern) {
-            bl.allow_regex.push(re);
+        match regex::Regex::new(pattern) {
+            Ok(re) => bl.allow_regex.push(re),
+            Err(e) => log::warn!("invalid regex_allow pattern {pattern:?}: {e}"),
         }
     }
 
