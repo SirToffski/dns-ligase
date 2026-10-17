@@ -3,6 +3,10 @@ name: Build Arch package
 on:
   workflow_dispatch:        # manual trigger only
 
+# Checkout, build and test only; no job writes to the repository.
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-latest
