@@ -2,6 +2,14 @@ use std::convert::TryInto;
 use std::io::{self, Cursor, Read};
 use std::net::Ipv4Addr;
 
+/// OPT TTL: the high bit of its low 16-bit flags field (RFC 6891).
+pub const EDNS_DO: u32 = 0x0000_8000;
+pub const MAX_DNS_MESSAGE: usize = u16::MAX as usize;
+
+#[cfg(test)]
+#[path = "dns_wire_tests.rs"]
+mod wire_tests;
+
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct DnsHeader {
     pub id: u16,
@@ -14,8 +22,22 @@ pub struct DnsHeader {
 
 impl DnsHeader {
     #[allow(dead_code)]
-    pub fn new(id: u16, flags: u16, qdcount: u16, ancount: u16, nscount: u16, arcount: u16) -> Self {
-        Self { id, flags, qdcount, ancount, nscount, arcount }
+    pub fn new(
+        id: u16,
+        flags: u16,
+        qdcount: u16,
+        ancount: u16,
+        nscount: u16,
+        arcount: u16,
+    ) -> Self {
+        Self {
+            id,
+            flags,
+            qdcount,
+            ancount,
+            nscount,
+            arcount,
+        }
     }
 
     pub fn parse(reader: &mut Cursor<&[u8]>) -> io::Result<Self> {
@@ -57,11 +79,15 @@ impl DnsQuestion {
         reader.read_exact(&mut type_buf)?;
         let qtype = u16::from_be_bytes(type_buf[0..2].try_into().unwrap());
         let qclass = u16::from_be_bytes(type_buf[2..4].try_into().unwrap());
-        Ok(Self { name, qtype, qclass })
+        Ok(Self {
+            name,
+            qtype,
+            qclass,
+        })
     }
 
     pub fn serialize(&self) -> io::Result<Vec<u8>> {
-        let mut buf = serialize_name(&self.name);
+        let mut buf = serialize_name(&self.name)?;
         buf.extend_from_slice(&self.qtype.to_be_bytes());
         buf.extend_from_slice(&self.qclass.to_be_bytes());
         Ok(buf)
@@ -91,6 +117,12 @@ impl DnsResourceRecord {
         let rclass = u16::from_be_bytes(meta_buf[2..4].try_into().unwrap());
         let ttl = u32::from_be_bytes(meta_buf[4..8].try_into().unwrap());
         let rdlength = u16::from_be_bytes(meta_buf[8..10].try_into().unwrap());
+        if reader.position() as usize + rdlength as usize > reader.get_ref().len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Truncated RDATA",
+            ));
+        }
 
         // For CNAME records, parse the target domain name from the rdata
         // position (which may contain compression pointers into the full
@@ -98,9 +130,15 @@ impl DnsResourceRecord {
         // happens. This is the only type whose rdata we need to interpret.
         let cname_target = if rtype == 5 {
             let saved = reader.position();
-            let target = parse_name(reader).ok();
+            let target = parse_name(reader)?;
+            if reader.position() != saved + u64::from(rdlength) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "CNAME length mismatch",
+                ));
+            }
             reader.set_position(saved);
-            target
+            Some(target)
         } else {
             None
         };
@@ -108,16 +146,36 @@ impl DnsResourceRecord {
         let mut rdata = vec![0u8; rdlength as usize];
         reader.read_exact(&mut rdata)?;
 
-        Ok(Self { name, rtype, rclass, ttl, rdata, cname_target })
+        Ok(Self {
+            name,
+            rtype,
+            rclass,
+            ttl,
+            rdata,
+            cname_target,
+        })
     }
 
+    /// Serialize a locally constructed RR. Opaque RDATA must be independent
+    /// of packet offsets; parsed packets should be relayed in their wire form.
     pub fn serialize(&self) -> io::Result<Vec<u8>> {
-        let mut buf = serialize_name(&self.name);
+        let mut buf = serialize_name(&self.name)?;
         buf.extend_from_slice(&self.rtype.to_be_bytes());
         buf.extend_from_slice(&self.rclass.to_be_bytes());
         buf.extend_from_slice(&self.ttl.to_be_bytes());
-        buf.extend_from_slice(&(self.rdata.len() as u16).to_be_bytes());
-        buf.extend_from_slice(&self.rdata);
+        // CNAME is the one name-bearing RDATA type we decode. Expand it when
+        // constructing a new packet instead of copying its old pointers.
+        let cname;
+        let rdata = if let Some(target) = self.cname_target.as_ref().filter(|_| self.rtype == 5) {
+            cname = serialize_name(target)?;
+            &cname
+        } else {
+            &self.rdata
+        };
+        let len = u16::try_from(rdata.len())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "RDATA too long"))?;
+        buf.extend_from_slice(&len.to_be_bytes());
+        buf.extend_from_slice(rdata);
         Ok(buf)
     }
 }
@@ -169,6 +227,17 @@ impl DnsMessage {
     }
 
     pub fn parse(data: &[u8]) -> io::Result<Self> {
+        Self::parse_wire(data).map(|(message, _)| message)
+    }
+
+    /// Also retain the OPT metadata offset for an in-place forwarding edit.
+    pub(crate) fn parse_wire(data: &[u8]) -> io::Result<(Self, Option<usize>)> {
+        if data.len() > MAX_DNS_MESSAGE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "DNS message too long",
+            ));
+        }
         let mut reader = Cursor::new(data);
         let header = DnsHeader::parse(&mut reader)?;
 
@@ -188,25 +257,62 @@ impl DnsMessage {
         }
 
         let mut additionals = Vec::new();
+        let mut opt_offset = None;
         for _ in 0..header.arcount {
-            additionals.push(DnsResourceRecord::parse(&mut reader)?);
-        }
-
-        let mut edns_do = false;
-        for opt in &additionals {
-            if opt.rtype == 41 { // OPT record type
-                if (opt.ttl & 0x80000000) != 0 {
-                    edns_do = true;
-                }
+            let rr = DnsResourceRecord::parse(&mut reader)?;
+            if rr.rtype == 41 {
+                opt_offset = Some(reader.position() as usize - rr.rdata.len() - 10);
             }
+            additionals.push(rr);
         }
 
-        Ok(Self { header, questions, answers, authorities, additionals, edns_do })
+        if reader.position() as usize != data.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Trailing DNS data",
+            ));
+        }
+        if answers.iter().chain(&authorities).any(|rr| rr.rtype == 41) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "OPT outside additional section",
+            ));
+        }
+        let mut opts = additionals.iter().filter(|rr| rr.rtype == 41);
+        let opt = opts.next();
+        if opts.next().is_some() || opt.is_some_and(|rr| !rr.name.is_empty()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid OPT record",
+            ));
+        }
+        let edns_do = opt.is_some_and(|opt| opt.ttl & EDNS_DO != 0);
+
+        Ok((
+            Self {
+                header,
+                questions,
+                answers,
+                authorities,
+                additionals,
+                edns_do,
+            },
+            opt_offset,
+        ))
     }
 
+    /// Construct a packet. Use `query_with_edns` to modify existing wire data:
+    /// opaque RDATA in parsed records can contain packet-relative pointers.
     pub fn serialize(&self) -> io::Result<Vec<u8>> {
         let mut header = self.header.clone();
-        header.arcount = self.additionals.len() as u16;
+        let count = |len| {
+            u16::try_from(len)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Too many DNS records"))
+        };
+        header.qdcount = count(self.questions.len())?;
+        header.ancount = count(self.answers.len())?;
+        header.nscount = count(self.authorities.len())?;
+        header.arcount = count(self.additionals.len())?;
         let mut buf = header.serialize()?;
         for q in &self.questions {
             buf.extend(q.serialize()?);
@@ -220,97 +326,209 @@ impl DnsMessage {
         for ad in &self.additionals {
             buf.extend(ad.serialize()?);
         }
+        if buf.len() > MAX_DNS_MESSAGE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "DNS message too long",
+            ));
+        }
         Ok(buf)
     }
 
-    pub fn add_opt_record(&mut self, buffer_size: u16) {
+    #[allow(dead_code)] // Also useful for locally constructed library packets.
+    pub fn add_opt_record(&mut self, buffer_size: u16) -> io::Result<()> {
         if let Some(opt) = self.additionals.iter_mut().find(|r| r.rtype == 41) {
             opt.rclass = buffer_size;
-            opt.ttl |= 0x80000000; // Set DO bit in TTL
+            opt.ttl |= EDNS_DO;
         } else {
-            let mut ttl = 0u32;
-            ttl |= 0x80000000; // Set DO bit in TTL
-
             let opt = DnsResourceRecord {
                 name: "".to_string(),
                 rtype: 41,
                 rclass: buffer_size,
-                ttl,
+                ttl: EDNS_DO,
                 rdata: vec![],
                 cname_target: None,
             };
             self.additionals.push(opt);
-            self.header.arcount += 1;
         }
+        self.header.arcount = u16::try_from(self.additionals.len())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Too many DNS records"))?;
+        self.edns_do = true;
+        Ok(())
     }
 }
 
-pub fn parse_name(reader: &mut Cursor<&[u8]>) -> io::Result<String> {
-    let mut labels = Vec::new();
-    let mut jumps = 0;
-    let max_jumps = 64;
-    let mut jumped = false;
-    let mut jump_pos = 0;
+/// Patch the OPT metadata found by parse_wire, leaving existing packet
+/// offsets intact. Opaque RDATA and all EDNS options retain their exact bytes.
+pub(crate) fn query_with_edns(
+    data: &[u8],
+    opt_offset: Option<usize>,
+    buffer_size: u16,
+) -> io::Result<Vec<u8>> {
+    let mut wire = data.to_vec();
+    if let Some(offset) = opt_offset {
+        wire[offset + 2..offset + 4].copy_from_slice(&buffer_size.to_be_bytes());
+        let ttl = u32::from_be_bytes(wire[offset + 4..offset + 8].try_into().unwrap()) | EDNS_DO;
+        wire[offset + 4..offset + 8].copy_from_slice(&ttl.to_be_bytes());
+    } else {
+        if data.len() + 11 > MAX_DNS_MESSAGE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "No room for OPT record",
+            ));
+        }
+        let count = u16::from_be_bytes([wire[10], wire[11]])
+            .checked_add(1)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "Too many additional records")
+            })?;
+        wire[10..12].copy_from_slice(&count.to_be_bytes());
+        wire.extend_from_slice(&[0, 0, 41]);
+        wire.extend_from_slice(&buffer_size.to_be_bytes());
+        wire.extend_from_slice(&EDNS_DO.to_be_bytes());
+        wire.extend_from_slice(&[0, 0]);
+    }
+    Ok(wire)
+}
 
+/// A reversible presentation name: separators are dots; dots, backslashes
+/// and non-printable/non-ASCII label octets are decimal escapes. This keeps
+/// suffix matching from treating an embedded dot as a new DNS label.
+pub fn parse_name(reader: &mut Cursor<&[u8]>) -> io::Result<String> {
+    use std::fmt::Write;
+    let mut name = String::new();
+    let mut jumps = 0;
+    let mut resume = None;
+    let mut expanded_len = 1;
     loop {
         let pos = reader.position() as usize;
-        if pos >= reader.get_ref().len() {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "End of data"));
-        }
-        let len = reader.get_ref()[pos];
-        if len == 0 {
-            if !jumped {
-                reader.set_position((pos + 1) as u64);
+        let len = *reader
+            .get_ref()
+            .get(pos)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "End of data"))?;
+        match len {
+            0 => {
+                reader.set_position(resume.unwrap_or(pos + 1) as u64);
+                return Ok(name);
             }
-            break;
-        } else if (len & 0xC0) == 0xC0 {
-            if pos + 1 >= reader.get_ref().len() {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Truncated compression pointer"));
+            0xc0..=0xff => {
+                let next = *reader.get_ref().get(pos + 1).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "Truncated compression pointer",
+                    )
+                })?;
+                let offset = (usize::from(len & 0x3f) << 8) | usize::from(next);
+                if offset >= reader.get_ref().len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Pointer out of bounds",
+                    ));
+                }
+                resume.get_or_insert(pos + 2);
+                jumps += 1;
+                if jumps > 64 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Too many DNS name compression jumps",
+                    ));
+                }
+                reader.set_position(offset as u64);
             }
-            let offset = (((len & 0x3F) as usize) << 8) | (reader.get_ref()[pos + 1] as usize);
-            if offset >= reader.get_ref().len() {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "Pointer out of bounds"));
+            1..=63 => {
+                expanded_len += usize::from(len) + 1;
+                if expanded_len > 255 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "DNS name exceeds 255 octets",
+                    ));
+                }
+                let end = pos + 1 + usize::from(len);
+                let label = reader.get_ref().get(pos + 1..end).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::UnexpectedEof, "Truncated label")
+                })?;
+                if !name.is_empty() {
+                    name.push('.');
+                }
+                for &byte in label {
+                    if (b'!'..=b'~').contains(&byte) && byte != b'.' && byte != b'\\' {
+                        name.push(char::from(byte));
+                    } else {
+                        let _ = write!(name, "\\{byte:03}");
+                    }
+                }
+                reader.set_position(end as u64);
             }
-            if !jumped {
-                jump_pos = pos + 2;
-                jumped = true;
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Unsupported DNS label type",
+                ))
             }
-            reader.set_position(offset as u64);
-            jumps += 1;
-            if jumps > max_jumps {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "Too many DNS name compression jumps"));
-            }
-        } else {
-            let label_start = pos + 1;
-            let label_end = label_start + len as usize;
-            if label_end > reader.get_ref().len() {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Truncated label"));
-            }
-            let label = std::str::from_utf8(&reader.get_ref()[label_start..label_end])
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid UTF-8 in label"))?;
-            labels.push(label.to_string());
-            reader.set_position(label_end as u64);
         }
     }
-
-    if jumped {
-        reader.set_position(jump_pos as u64);
-    }
-
-    Ok(labels.join("."))
 }
 
-pub fn serialize_name(name: &str) -> Vec<u8> {
-    let mut buf = Vec::new();
-    for label in name.split('.') {
-        if label.is_empty() { continue; }
-        buf.push(label.len() as u8);
-        buf.extend_from_slice(label.as_bytes());
+/// Encode a presentation name, checking both label and expanded name limits.
+pub fn serialize_name(name: &str) -> io::Result<Vec<u8>> {
+    if name.is_empty() || name == "." {
+        return Ok(vec![0]);
     }
-    buf.push(0);
-    buf
+    let invalid = |message| io::Error::new(io::ErrorKind::InvalidInput, message);
+    let mut wire = Vec::new();
+    let mut label = Vec::new();
+    let bytes = name.as_bytes();
+    let mut pos = 0;
+    while pos < bytes.len() {
+        match bytes[pos] {
+            b'.' => {
+                if label.is_empty() {
+                    return Err(invalid("Empty DNS label"));
+                }
+                wire.push(label.len() as u8);
+                wire.extend_from_slice(&label);
+                label.clear();
+                pos += 1;
+            }
+            b'\\' => {
+                pos += 1;
+                let first = *bytes
+                    .get(pos)
+                    .ok_or_else(|| invalid("Incomplete DNS name escape"))?;
+                if first.is_ascii_digit() {
+                    let digits = bytes
+                        .get(pos..pos + 3)
+                        .filter(|s| s.iter().all(u8::is_ascii_digit))
+                        .ok_or_else(|| invalid("Expected three decimal escape digits"))?;
+                    let value = (u16::from(digits[0] - b'0') * 100)
+                        + (u16::from(digits[1] - b'0') * 10)
+                        + u16::from(digits[2] - b'0');
+                    label.push(u8::try_from(value).map_err(|_| invalid("DNS escape exceeds 255"))?);
+                    pos += 3;
+                } else {
+                    label.push(first);
+                    pos += 1;
+                }
+            }
+            byte => {
+                label.push(byte);
+                pos += 1;
+            }
+        }
+        if label.len() > 63 {
+            return Err(invalid("DNS label exceeds 63 octets"));
+        }
+    }
+    if !label.is_empty() {
+        wire.push(label.len() as u8);
+        wire.extend_from_slice(&label);
+    }
+    wire.push(0);
+    if wire.len() > 255 {
+        return Err(invalid("DNS name exceeds 255 octets"));
+    }
+    Ok(wire)
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -409,11 +627,8 @@ mod tests {
             edns_do: false,
         };
 
-        msg.add_opt_record(1232);
-        assert!(!msg.edns_do); // add_opt_record doesn't set edns_do on the msg itself, but adds the record
-
-        // Wait, add_opt_record sets ttl bit.
-        // DnsMessage::parse should detect it.
+        msg.add_opt_record(1232).unwrap();
+        assert!(msg.edns_do);
         let serialized = msg.serialize().unwrap();
         let parsed = DnsMessage::parse(&serialized).unwrap();
         assert!(parsed.edns_do);
@@ -454,7 +669,7 @@ mod tests {
             rtype: 5,
             rclass: 1,
             ttl: 300,
-            rdata: crate::dns::serialize_name(target),
+            rdata: crate::dns::serialize_name(target).unwrap(),
             cname_target: Some(target.to_string()),
         }
     }

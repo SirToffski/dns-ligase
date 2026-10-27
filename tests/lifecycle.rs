@@ -217,7 +217,7 @@ async fn dns(hold_site: bool) -> Dns {
                     if site {
                         msg.answers.push(DnsResourceRecord {
                             name: "site.test".into(), rtype: 5, rclass: 1, ttl: 60,
-                            rdata: rust_dns::dns::serialize_name("tracker.test"), cname_target: None,
+                            rdata: rust_dns::dns::serialize_name("tracker.test").unwrap(), cname_target: None,
                         });
                         msg.header.ancount = 1;
                     }

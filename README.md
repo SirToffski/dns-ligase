@@ -26,7 +26,7 @@ client → UDP/TCP listener → parse DNS wire format → extract QNAME
 
 | Module | Responsibility |
 | --- | --- |
-| `dns.rs` | Hand-rolled DNS wire format: header, question, resource record, message. Name parsing with compression-pointer support and jump limits, EDNS0/OPT handling. |
+| `dns.rs` | Hand-rolled DNS wire format: header, question, resource record, message. Reversible byte escapes for names, compression-pointer and length checks, EDNS0/OPT handling. |
 | `blocklist.rs` | Rule storage and matching. List fetching with an on-disk cache, conditional GETs, and format parsing. |
 | `upstream.rs` | Upstream connection pool (UDP + TCP, shared across queries), UDP and TCP listeners, blocklist check, NXDOMAIN construction, DO-bit injection, forwarding, truncation/TCP fallback, timeouts, query logging. |
 | `journald.rs` | Minimal journald native protocol sender for structured query logs (no external crate). |
@@ -84,8 +84,9 @@ Startup loads manual rules and all readable cached bodies, including stale ones,
 - UDP and TCP listeners (TCP with correct 2-byte length prefix)
 - Hand-written wire format parser and serializer
 - Name compression pointers with bounds checks and a jump limit
+- Names retain literal dots, backslashes and arbitrary label bytes using decimal escapes internally; only actual label boundaries become dots. Reserved label types and overlong names are rejected. Forwarded queries retain their original wire layout, so adding/updating OPT does not relocate compression pointers in opaque RDATA.
 - EDNS0: advertises a 1232-byte buffer, sets the DO bit on outgoing queries even when the client didn't, passes RRSIG/NSEC and the AD flag through untouched
-- Truncation handling: if an upstream UDP response comes back with the TC bit set, the query is retried over TCP to retrieve the full response; if the final response is still too large for the client's UDP path (its OPT buffer size, or 512 bytes with no OPT), a header-only response with the TC bit set is returned so the client retries over TCP
+- Truncation handling: if an upstream UDP response comes back with TC set, the query is retried over TCP. A response exceeding the client's UDP path is reduced to a TC reply with the question and OPT when they fit. Oversized OPT options are dropped. The client limit is its advertised size, with a 512-byte minimum and the IPv4 UDP payload ceiling; without OPT it is 512 bytes.
 - Upstream connection reuse: a bounded pool of connected UDP and TCP sockets to the upstream, shared across queries; timed-out or errored sockets are discarded rather than returned, so a late stray response can never leak into a later query; a dead pooled TCP connection is retried once on a fresh one
 - Timeouts on all upstream and client I/O; a dead listener exits loudly so systemd restarts the unit instead of serving half-protocol
 

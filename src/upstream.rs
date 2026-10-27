@@ -9,8 +9,12 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::time::{timeout, Duration};
 
 use crate::blocklist::{Blocklist, MatchOutcome};
-use crate::dns::DnsMessage;
+use crate::dns::{query_with_edns, DnsMessage};
 use crate::journald;
+
+#[cfg(test)]
+#[path = "wire_forward_tests.rs"]
+mod wire_forward_tests;
 
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(2);
 /// EDNS0 UDP payload size we advertise to upstream and the size of our
@@ -19,6 +23,7 @@ const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(2);
 /// IP fragmentation. We advertise this fixed size regardless of what the client
 /// asked for; the client's own limit is honored separately via truncation.
 const EDNS_BUFFER_SIZE: usize = 1232;
+const MAX_UDP_PAYLOAD: usize = 65_507;
 /// How long to wait for a client to send the next query on an idle TCP
 /// connection (RFC 7766 idle timeout). A clean EOF or expiry here closes the
 /// connection normally — not an error.
@@ -254,7 +259,7 @@ impl UdpForwarder {
         let state_udp = Arc::clone(&self.state);
 
         tasks.push(tokio::spawn(async move {
-            let mut buf = [0u8; 4096];
+            let mut buf = [0u8; 65535];
             loop {
                 match udp_socket.recv_from(&mut buf).await {
                     Ok((len, addr)) => {
@@ -316,7 +321,7 @@ impl UdpForwarder {
         client: std::net::SocketAddr,
         packet: Vec<u8>,
     ) -> io::Result<()> {
-        let msg = match DnsMessage::parse(&packet[..]) {
+        let (msg, opt_offset) = match DnsMessage::parse_wire(&packet[..]) {
             Ok(m) => m,
             Err(e) => {
                 log::error!("Failed to parse incoming UDP packet: {}", e);
@@ -359,29 +364,8 @@ impl UdpForwarder {
             }
         }
 
-        // Client's UDP payload size: from its OPT record if present, else the
-        // RFC 1035 default of 512. Used to decide client-side truncation.
-        let mut client_udp_size: usize = 512;
-        for opt in &msg.additionals {
-            if opt.rtype == 41 {
-                let size = opt.rclass as usize;
-                if size > 0 && size <= 4096 {
-                    client_udp_size = size;
-                }
-                break;
-            }
-        }
-
-        // Always advertise a fixed 1232-byte EDNS0 buffer to upstream and
-        // ensure the DO bit is set. add_opt_record rewrites an existing OPT
-        // record in place (preserving any client EDNS options in its rdata) or
-        // adds one if absent.
-        let packet_to_send = {
-            let mut msg_to_send = msg.clone();
-            msg_to_send.edns_do = true;
-            msg_to_send.add_opt_record(EDNS_BUFFER_SIZE as u16);
-            msg_to_send.serialize()?
-        };
+        let client_udp_size = client_udp_limit(&msg);
+        let packet_to_send = query_with_edns(&packet, opt_offset, EDNS_BUFFER_SIZE as u16)?;
 
         let mut resp = state.upstream.udp_query(&packet_to_send).await?;
 
@@ -430,7 +414,7 @@ impl UdpForwarder {
                 resp.len(),
                 client_udp_size
             );
-            resp = truncate_response(&resp)?;
+            resp = truncate_response(&resp, client_udp_size)?;
         }
 
         socket.send_to(&resp, client).await?;
@@ -475,7 +459,7 @@ impl UdpForwarder {
                 .await
                 .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Client read timeout"))??;
 
-            let msg = match DnsMessage::parse(&packet[..]) {
+            let (msg, opt_offset) = match DnsMessage::parse_wire(&packet[..]) {
                 Ok(m) => m,
                 Err(e) => return Err(e),
             };
@@ -514,12 +498,7 @@ impl UdpForwarder {
                 }
             }
 
-            let packet_to_send = {
-                let mut msg_to_send = msg.clone();
-                msg_to_send.edns_do = true;
-                msg_to_send.add_opt_record(EDNS_BUFFER_SIZE as u16);
-                msg_to_send.serialize()?
-            };
+            let packet_to_send = query_with_edns(&packet, opt_offset, EDNS_BUFFER_SIZE as u16)?;
 
             let resp = state.upstream.tcp_query(&packet_to_send).await?;
 
@@ -596,7 +575,7 @@ fn qtype_str(qtype: u16) -> &'static str {
 /// Build an NXDOMAIN response for a blocked query, preserving the question.
 fn build_nxdomain(msg: &DnsMessage) -> io::Result<Vec<u8>> {
     let mut response_msg = msg.clone();
-    response_msg.header.flags = 0x8183; // QR|RD|RA|NXDOMAIN
+    response_msg.header.flags = (msg.header.flags & 0x7910) | 0x8083; // opcode/RD/CD, QR|RA|NXDOMAIN
     response_msg.header.qdcount = 1;
     response_msg.header.ancount = 0;
     response_msg.header.nscount = 0;
@@ -632,19 +611,40 @@ fn tc_bit_set(msg: &[u8]) -> bool {
     (flags & 0x0200) != 0
 }
 
-/// Build a truncated response for a UDP client: keep the question (and the OPT
-/// record if present), drop the answer/authority sections, and set the TC bit
-/// so the client retries over TCP.
-fn truncate_response(resp: &[u8]) -> io::Result<Vec<u8>> {
+/// EDNS advertisements below 512 have the same meaning as 512. Larger sizes
+/// are limited only by the IPv4 UDP payload ceiling, rather than reverting to
+/// the legacy limit and causing unnecessary TCP retries.
+fn client_udp_limit(msg: &DnsMessage) -> usize {
+    msg.additionals.iter().find(|rr| rr.rtype == 41)
+        .map(|opt| usize::from(opt.rclass)).unwrap_or(512).clamp(512, MAX_UDP_PAYLOAD)
+}
+
+/// Keep the question and OPT when they fit, setting TC so the client retries
+/// over TCP. Oversized OPT options cannot inflate the truncated reply.
+fn truncate_response(resp: &[u8], limit: usize) -> io::Result<Vec<u8>> {
     let mut msg = DnsMessage::parse(resp)?;
     msg.answers.clear();
     msg.authorities.clear();
     // Keep only the OPT record (if any) in additionals; drop everything else.
     msg.additionals.retain(|r| r.rtype == 41);
-    msg.header.flags |= 0x0200; // TC
+    msg.header.flags = (msg.header.flags | 0x0200) & !0x0020; // TC, clear AD
     msg.header.ancount = 0;
     msg.header.nscount = 0;
-    msg.serialize()
+    let mut wire = msg.serialize()?;
+    if wire.len() > limit {
+        // Large OPT options (e.g. padding) must not make the TC reply exceed
+        // the client's path. Preserve its extended RCODE and flags.
+        for opt in &mut msg.additionals { opt.rdata.clear(); }
+        wire = msg.serialize()?;
+    }
+    if wire.len() > limit {
+        msg.questions.clear();
+        wire = msg.serialize()?;
+    }
+    if wire.len() > limit {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "UDP limit too small for DNS header"));
+    }
+    Ok(wire)
 }
 
 #[cfg(test)]
@@ -697,7 +697,7 @@ mod tests {
             name: "".to_string(),
             rtype: 41,
             rclass: 1232,
-            ttl: 0x80000000,
+            ttl: crate::dns::EDNS_DO,
             rdata: vec![],
             cname_target: None,
         };
@@ -710,7 +710,7 @@ mod tests {
         let serialized = msg.serialize().unwrap();
         assert!(serialized.len() > 512);
 
-        let truncated = truncate_response(&serialized).unwrap();
+        let truncated = truncate_response(&serialized, 512).unwrap();
         let parsed = DnsMessage::parse(&truncated).unwrap();
 
         assert_ne!(parsed.header.flags & 0x0200, 0, "TC bit must be set");
