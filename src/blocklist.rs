@@ -341,7 +341,7 @@ pub struct CachedList {
     pub filename: String,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct CachedLists {
     pub map: HashMap<String, CachedList>,
     #[serde(skip)]
@@ -543,6 +543,34 @@ fn atomic_write(path: &Path, data: &[u8]) -> io::Result<()> {
 }
 
 impl CachedLists {
+    /// Usable cached bodies, regardless of age, for serving during startup.
+    pub fn cached_bodies(&self, urls: &[String], cache_path: &str) -> HashMap<String, String> {
+        urls.iter().filter_map(|url| {
+            let filename = self.map.get(url).map(|entry| entry.filename.clone())
+                .unwrap_or_else(|| url_to_filename(url));
+            read_body_file(cache_path, &filename).map(|body| (url.clone(), body))
+        }).collect()
+    }
+
+    /// Prepare a new cache location without changing the active cache. Failed
+    /// migration leaves the old location available to serving queries/reloads.
+    pub fn migrate_to(&self, old_path: &str, new_path: &str, urls: &[String]) -> io::Result<Self> {
+        let mut migrated = Self::default();
+        for (url, body) in self.cached_bodies(urls, old_path) {
+            let filename = url_to_filename(&url);
+            migrated.write_body(new_path, &filename, &body)?;
+            let mut entry = self.map.get(&url).cloned().unwrap_or(CachedList {
+                fetched_at: 0, etag: None, filename: filename.clone(),
+            });
+            entry.filename = filename;
+            migrated.map.insert(url, entry);
+        }
+        // Also verifies a writable destination when no body files exist.
+        migrated.dirty = true;
+        migrated.save_to_disk(new_path)?;
+        Ok(migrated)
+    }
+
     #[allow(dead_code)]
     pub fn new() -> Self {
         Self::default()

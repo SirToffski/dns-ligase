@@ -32,7 +32,8 @@ client → UDP/TCP listener → parse DNS wire format → extract QNAME
 | `journald.rs` | Minimal journald native protocol sender for structured query logs (no external crate). |
 | `stats.rs` | `stats` subcommand: reads journald JSON, filters by action/domain/source/time, prints table or summary. |
 | `config.rs` | TOML config structs. |
-| `main.rs` | Wiring, initial list load, periodic refresh, SIGHUP reload, SIGTERM shutdown, `stats` subcommand dispatch. |
+| `main.rs` | Startup, listener wiring, signal registration, `stats` subcommand dispatch. |
+| `reload.rs` | Cached startup rules, coordinated periodic refresh and SIGHUP reload, config validation, cache migration, SIGTERM persistence. |
 
 ### Matching
 
@@ -48,9 +49,11 @@ Rules are stored in three shapes, checked with allow always beating block:
 
 ### Concurrency
 
-Blocklists live behind `Arc<RwLock<Blocklist>>`. Query handlers take a read lock; refreshes build an entirely new `Blocklist` and swap it in under a write lock, so a reload never leaves a partially-populated list visible to queries. Config lives behind its own `Arc<RwLock<Config>>` and is read per-query, so upstream changes take effect without a restart.
+Each query takes a brief read lock to clone one immutable serving snapshot: rules, upstream pool, and query-logging setting. It keeps that snapshot across upstream I/O and CNAME checks. Rebuilds publish a complete replacement under the same lock; in-flight queries finish with their original snapshot.
 
-List refreshes fetch all URLs concurrently and never hold the cache lock across network I/O — only the quick plan and merge steps take it.
+One coordinator owns periodic refreshes and SIGHUP reloads, so an older build cannot overwrite a completed reload or prune its cache. A SIGHUP arriving during a fetch waits for that bounded fetch to finish. Fetches run concurrently; parsing and filesystem work run on blocking workers, outside the serving lock.
+
+Startup loads manual rules and all readable cached bodies, including stale ones, then binds both UDP and TCP before the first remote refresh. Missing lists are temporarily absent (fail-open); logs distinguish listener readiness from completion of the initial refresh. List-server outages do not prevent DNS from starting. SIGTERM cancels active downloads and saves the currently active cache.
 
 ## Features
 
@@ -88,7 +91,8 @@ List refreshes fetch all URLs concurrently and never hold the cache lock across 
 
 **Operations**
 
-- `SIGHUP` reloads config and rebuilds the blocklist, logging every individual change (lists added/removed, rules added/removed, upstream changed, query logging toggled). A bad upstream address rejects the whole reload rather than half-applying it.
+- `SIGHUP` validates config, rebuilds the blocklist, and publishes rules, upstream and logging together, logging individual changes. Invalid manual regexes, a zero/unsupported refresh interval, a zero upstream port, or a failed cache-path migration reject the reload while preserving the active state. Invalid startup config exits with an error.
+- Refresh-interval changes reset the timer after reload. Cache-path changes prepare the destination and copy usable configured list bodies before publication; the old cache location is retained.
 - `SIGTERM` saves the cache and exits cleanly
 - Config path via `--config`, `DNS_LIGASE_CONFIG`, or `./config.toml` in that order
 - systemd unit with `DynamicUser`, `ProtectSystem=strict`, and `ExecReload`
@@ -255,7 +259,7 @@ journalctl -u dns-ligase -f
 ## Known issues
 
 - **`use_tcp` config field** is parsed but ignored; upstream transport follows the client's transport, not config.
-- **Cold boot with an unreachable upstream and an empty cache yields empty lists** (fail-open). It recovers on the next refresh once the upstream is reachable.
+- **Cold boot with an empty cache serves manual rules immediately while remote lists load** (fail-open for missing lists). If the fetch fails, it retries on the next configured refresh or SIGHUP once the upstream/list servers are reachable.
 
 Not yet implemented:
 

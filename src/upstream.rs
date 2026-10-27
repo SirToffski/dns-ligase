@@ -218,36 +218,31 @@ impl Upstream {
     }
 }
 
-/// Shared, swappable handle to the current upstream pool.
-///
-/// Query handlers take a brief read lock only to clone the inner `Arc<Upstream>`,
-/// then drop the lock and do I/O against their clone — so a SIGHUP swap never
-/// blocks in-flight queries. On swap, in-flight queries holding the old `Arc`
-/// finish against the old address; new queries use the new one.
-pub type UpstreamHandle = Arc<RwLock<Arc<Upstream>>>;
+/// One immutable serving generation. Each query keeps its snapshot across I/O.
+pub struct QueryState {
+    pub upstream: Arc<Upstream>,
+    pub blocklist: Arc<Blocklist>,
+    pub log_queries: bool,
+}
+
+pub type QueryStateHandle = Arc<RwLock<Arc<QueryState>>>;
 
 pub struct UdpForwarder {
     udp_socket: Arc<UdpSocket>,
-    listen_addr: String,
-    upstream: UpstreamHandle,
-    blocklist: Arc<RwLock<Blocklist>>,
-    log_queries: Arc<RwLock<bool>>,
+    tcp_listener: Arc<TcpListener>,
+    state: QueryStateHandle,
 }
 
 impl UdpForwarder {
-    pub async fn new(
-        listen_addr: &str,
-        upstream: UpstreamHandle,
-        blocklist: Arc<RwLock<Blocklist>>,
-        log_queries: Arc<RwLock<bool>>,
-    ) -> io::Result<Self> {
+    pub async fn new(listen_addr: &str, state: QueryStateHandle) -> io::Result<Self> {
         let socket = UdpSocket::bind(listen_addr).await?;
+        // Bind both transports before reporting readiness, using the actual
+        // UDP address so port 0 also selects the same port for TCP.
+        let listener = TcpListener::bind(socket.local_addr()?).await?;
         Ok(Self {
             udp_socket: Arc::new(socket),
-            listen_addr: listen_addr.to_string(),
-            upstream,
-            blocklist,
-            log_queries,
+            tcp_listener: Arc::new(listener),
+            state,
         })
     }
 
@@ -256,9 +251,7 @@ impl UdpForwarder {
 
         // UDP Task
         let udp_socket = Arc::clone(&self.udp_socket);
-        let upstream_udp = Arc::clone(&self.upstream);
-        let blocklist_udp = Arc::clone(&self.blocklist);
-        let log_udp = Arc::clone(&self.log_queries);
+        let state_udp = Arc::clone(&self.state);
 
         tasks.push(tokio::spawn(async move {
             let mut buf = [0u8; 4096];
@@ -266,18 +259,14 @@ impl UdpForwarder {
                 match udp_socket.recv_from(&mut buf).await {
                     Ok((len, addr)) => {
                         let packet = buf[..len].to_vec();
-                        let upstream_ref = Arc::clone(&upstream_udp);
-                        let blocklist_ref = Arc::clone(&blocklist_udp);
+                        let state_ref = Arc::clone(&state_udp);
                         let socket_ref = Arc::clone(&udp_socket);
-                        let log_ref = Arc::clone(&log_udp);
                         tokio::spawn(async move {
                             if let Err(e) = Self::handle_udp_query(
                                 socket_ref,
-                                upstream_ref,
+                                state_ref,
                                 addr,
                                 packet,
-                                blocklist_ref,
-                                log_ref,
                             )
                             .await
                             {
@@ -296,28 +285,15 @@ impl UdpForwarder {
         }));
 
         // TCP Task
-        let listen_addr_tcp = self.listen_addr.clone();
-        let upstream_tcp = Arc::clone(&self.upstream);
-        let blocklist_tcp = Arc::clone(&self.blocklist);
-        let log_tcp = Arc::clone(&self.log_queries);
+        let listener = Arc::clone(&self.tcp_listener);
+        let state_tcp = Arc::clone(&self.state);
         tasks.push(tokio::spawn(async move {
-            let listener = match TcpListener::bind(&listen_addr_tcp).await {
-                Ok(l) => l,
-                Err(e) => {
-                    // Fail loud: a half-dead process (UDP up, TCP down) looks
-                    // healthy to systemd. Exiting lets the unit restart us.
-                    log::error!("TCP bind on {listen_addr_tcp} failed: {e}; exiting");
-                    std::process::exit(1);
-                }
-            };
             loop {
                 if let Ok((mut stream, addr)) = listener.accept().await {
-                    let upstream_ref = Arc::clone(&upstream_tcp);
-                    let blocklist_ref = Arc::clone(&blocklist_tcp);
-                    let log_ref = Arc::clone(&log_tcp);
+                    let state_ref = Arc::clone(&state_tcp);
                     tokio::spawn(async move {
                         if let Err(e) =
-                            Self::handle_tcp_query(&mut stream, upstream_ref, addr, blocklist_ref, log_ref)
+                            Self::handle_tcp_query(&mut stream, state_ref, addr)
                                 .await
                         {
                             log::error!("TCP query error: {}", e);
@@ -336,11 +312,9 @@ impl UdpForwarder {
 
     async fn handle_udp_query(
         socket: Arc<UdpSocket>,
-        upstream: UpstreamHandle,
+        state_handle: QueryStateHandle,
         client: std::net::SocketAddr,
         packet: Vec<u8>,
-        blocklist: Arc<RwLock<Blocklist>>,
-        log_queries: Arc<RwLock<bool>>,
     ) -> io::Result<()> {
         let msg = match DnsMessage::parse(&packet[..]) {
             Ok(m) => m,
@@ -350,12 +324,14 @@ impl UdpForwarder {
             }
         };
 
+        let state = state_handle.read().await.clone();
+
         if let Some(q) = msg.questions.first() {
-            let outcome = blocklist.read().await.check(&q.name);
+            let outcome = state.blocklist.check(&q.name);
             match outcome {
                 MatchOutcome::Blocked(rule) => {
                     log::info!("Blocking domain: {}", q.name);
-                    if *log_queries.read().await {
+                    if state.log_queries {
                         journald::log_query(
                             &client.ip().to_string(),
                             &q.name,
@@ -369,7 +345,7 @@ impl UdpForwarder {
                     return Ok(());
                 }
                 MatchOutcome::Allowed(rule) => {
-                    if *log_queries.read().await {
+                    if state.log_queries {
                         journald::log_query(
                             &client.ip().to_string(),
                             &q.name,
@@ -407,16 +383,13 @@ impl UdpForwarder {
             msg_to_send.serialize()?
         };
 
-        // Clone the current upstream Arc without holding the lock across I/O.
-        let upstream = upstream.read().await.clone();
-
-        let mut resp = upstream.udp_query(&packet_to_send).await?;
+        let mut resp = state.upstream.udp_query(&packet_to_send).await?;
 
         // Upstream truncated even within our advertised buffer: fall back to TCP
         // to retrieve the full response.
         if tc_bit_set(&resp) {
             log::debug!("Upstream set TC; retrying over TCP");
-            resp = upstream.tcp_query(&packet_to_send).await?;
+            resp = state.upstream.tcp_query(&packet_to_send).await?;
         }
 
         // CNAME cloaking check: parse the response and walk the answer section
@@ -430,9 +403,9 @@ impl UdpForwarder {
                         continue;
                     }
                     let Some(target) = &rr.cname_target else { continue };
-                    if let MatchOutcome::Blocked(rule) = blocklist.read().await.check(target) {
+                    if let MatchOutcome::Blocked(rule) = state.blocklist.check(target) {
                         log::info!("Blocking CNAME target {target} for {}", q.name);
-                        if *log_queries.read().await {
+                        if state.log_queries {
                             journald::log_query(
                                 &client.ip().to_string(),
                                 &q.name,
@@ -462,7 +435,7 @@ impl UdpForwarder {
 
         socket.send_to(&resp, client).await?;
 
-        if *log_queries.read().await {
+        if state.log_queries {
             if let Some(q) = msg.questions.first() {
                 journald::log_query(
                     &client.ip().to_string(),
@@ -478,10 +451,8 @@ impl UdpForwarder {
 
     async fn handle_tcp_query(
         client_stream: &mut TcpStream,
-        upstream: UpstreamHandle,
+        state_handle: QueryStateHandle,
         client_addr: std::net::SocketAddr,
-        blocklist: Arc<RwLock<Blocklist>>,
-        log_queries: Arc<RwLock<bool>>,
     ) -> io::Result<()> {
         // RFC 7766: a client may send multiple queries on one TCP connection.
         // Loop until the client closes the connection (clean EOF), goes idle
@@ -509,13 +480,15 @@ impl UdpForwarder {
                 Err(e) => return Err(e),
             };
 
+            let state = state_handle.read().await.clone();
+
             if let Some(q) = msg.questions.first() {
-                let outcome = blocklist.read().await.check(&q.name);
+                let outcome = state.blocklist.check(&q.name);
                 match outcome {
                     MatchOutcome::Blocked(rule) => {
                         let response = build_nxdomain(&msg)?;
                         write_tcp_message(client_stream, &response).await?;
-                        if *log_queries.read().await {
+                        if state.log_queries {
                             journald::log_query(
                                 &client_addr.ip().to_string(),
                                 &q.name,
@@ -527,7 +500,7 @@ impl UdpForwarder {
                         continue 'next_query;
                     }
                     MatchOutcome::Allowed(rule) => {
-                        if *log_queries.read().await {
+                        if state.log_queries {
                             journald::log_query(
                                 &client_addr.ip().to_string(),
                                 &q.name,
@@ -548,8 +521,7 @@ impl UdpForwarder {
                 msg_to_send.serialize()?
             };
 
-            let upstream = upstream.read().await.clone();
-            let resp = upstream.tcp_query(&packet_to_send).await?;
+            let resp = state.upstream.tcp_query(&packet_to_send).await?;
 
             // CNAME cloaking check: same as the UDP path. If a CNAME target in
             // the answer section is blocked, return NXDOMAIN for the original
@@ -561,9 +533,9 @@ impl UdpForwarder {
                             continue;
                         }
                         let Some(target) = &rr.cname_target else { continue };
-                        if let MatchOutcome::Blocked(rule) = blocklist.read().await.check(target) {
+                        if let MatchOutcome::Blocked(rule) = state.blocklist.check(target) {
                             log::info!("Blocking CNAME target {target} for {}", q.name);
-                            if *log_queries.read().await {
+                            if state.log_queries {
                                 journald::log_query(
                                     &client_addr.ip().to_string(),
                                     &q.name,
@@ -582,7 +554,7 @@ impl UdpForwarder {
 
             write_tcp_message(client_stream, &resp).await?;
 
-            if *log_queries.read().await {
+            if state.log_queries {
                 if let Some(q) = msg.questions.first() {
                     journald::log_query(
                         &client_addr.ip().to_string(),

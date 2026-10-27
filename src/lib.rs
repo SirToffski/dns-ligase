@@ -4,3 +4,4 @@ pub mod config;
 pub mod upstream;
 pub mod journald;
 pub mod stats;
+pub mod reload;
