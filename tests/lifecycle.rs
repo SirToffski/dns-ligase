@@ -16,6 +16,17 @@ use tokio::sync::Semaphore;
 use tokio::task::{JoinHandle, JoinSet};
 
 static ID: AtomicUsize = AtomicUsize::new(0);
+
+fn free_test_port() -> u16 {
+    for _ in 0..100 {
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = tcp.local_addr().unwrap().port();
+        if std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
+    panic!("No free TCP/UDP test port");
+}
 struct App {
     dir: PathBuf,
     port: u16,
@@ -36,11 +47,7 @@ impl App {
             ID.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir(&dir).unwrap();
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
+        let port = free_test_port();
         Self {
             cache_path: dir.join("cache.json"),
             dir,
@@ -121,11 +128,18 @@ queries=false
                 if self.log().contains(marker) {
                     return;
                 }
-                assert!(
-                    self.child.as_mut().unwrap().try_wait().unwrap().is_none(),
-                    "{}",
-                    self.log()
-                );
+                if self.child.as_mut().unwrap().try_wait().unwrap().is_some() {
+                    let log = self.log();
+                    if !log.contains("Listening on") && log.contains("AddrInUse") {
+                        // There is no cross-process reservation after picking a
+                        // port. Retry only this pre-readiness fixture collision,
+                        // within the same bounded wait; real server errors fail.
+                        self.port = free_test_port();
+                        self.start();
+                        continue;
+                    }
+                    panic!("{log}");
+                }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
@@ -685,4 +699,16 @@ async fn regex_list_diagnostics_include_url_line_and_summary() {
     );
     assert_eq!(rcode(&app.udp("safe.test").await.unwrap()), 0);
     app.stop().await;
+}
+
+#[test]
+fn stats_filter_options_require_a_value() {
+    for flag in ["--domain", "--src", "--since"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_dns-ligase"))
+            .args(["stats", flag])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("requires a value"));
+    }
 }

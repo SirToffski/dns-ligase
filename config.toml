@@ -15,4 +15,6 @@ refresh_interval_secs = 3600
 manual_block = ["ads.example.com"]
 manual_allow = []
 regex_block = ["^(.+[_.-])?telemetry[_.-]"]
+# Regex strings: '\.' in single quotes equals "\\." in double quotes.
+# Regexes use regex syntax, not shell globs such as "*.example.com".
 regex_allow = []

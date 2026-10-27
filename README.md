@@ -109,7 +109,9 @@ Startup loads manual rules and all readable cached bodies, including stale ones,
 - Optional per-query logging to journald with structured fields, enabled via `[logging] queries = true`
 - Each log entry carries: source IP, domain, query type, action (blocked/allowed/forwarded), and the matched rule
 - One filtering decision is logged per completed response. Failed delivery produces an operational error rather than a misleading success entry. Journal writes are nonblocking and best-effort; entries may be dropped if journald is unavailable or congested.
-- `dns-ligase stats` subcommand reads and filters the logs:
+- `dns-ligase stats` streams journal entries and prints rows as they arrive. Summaries retain counts per action/domain/source rather than every query. Exact action filters are sent to journalctl; domain and source filters remain case-sensitive substrings. Times are printed in UTC.
+- Filter options requiring a value (`--domain`, `--src`, `--since`) reject missing arguments. Closing a downstream pipe stops and reaps journalctl cleanly.
+- Examples:
   ```
   dns-ligase stats                        # all recent queries
   dns-ligase stats --blocked              # blocked only
@@ -143,6 +145,19 @@ sudo systemctl enable --now dns-ligase
 ```
 
 Installs the binary to `/usr/bin/dns-ligase`, config to `/etc/dns-ligase/config.toml` (marked `backup=`, so pacman won't clobber your edits), and the unit to `/usr/lib/systemd/system/`.
+
+The Git package normally builds upstream HEAD. To package a local committed revision, copy the recipe to a separate build directory (makepkg updates `pkgver` and creates build files):
+
+```bash
+repo=$(git rev-parse --show-toplevel)
+revision=$(git rev-parse HEAD)
+build_dir=$(mktemp -d)
+cp "$repo/PKGBUILD/PKGBUILD" "$build_dir/PKGBUILD"
+cd "$build_dir"
+DNS_LIGASE_SOURCE="git+file://${repo}#commit=${revision}" makepkg --check
+```
+
+The package's `check()` runs `cargo test --locked`. The recipe disables makepkg's C/C++ LTO because mimalloc includes C code, while retaining Rust's ThinLTO from `Cargo.toml`. The manual GitHub workflow pins its selected checkout commit through this same override and checks that the packaged source revision matches. Nothing publishes or installs the resulting package automatically.
 
 **From source:**
 
@@ -209,6 +224,8 @@ regex_allow = []
 queries = false
 ```
 
+TOML single-quoted strings preserve backslashes. For example, `'^ads\.example\.com$'` and `"^ads\\.example\\.com$"` are equivalent regexes. A glob such as `"*.example.com"` is not a valid regex; use `'(^|\.)example\.com$'` for that domain and its subdomains. Invalid manual regexes reject startup/reload; unsupported remote patterns (including lookaround) are skipped with diagnostics rather than silently rewritten.
+
 If you point `upstream` at a public resolver instead of a local validating one, you lose the DNSSEC validation this is designed around.
 
 Blocklist hostnames resolve through `[upstream]`, so dns-ligase can be the machine's only resolver: point DNS at it directly. If you previously worked around the old boot deadlock with a second unbound listener plus a NetworkManager DNS override, that workaround is no longer needed — removing it is a deliberate manual step, nothing in code touches your network config.
@@ -223,11 +240,15 @@ kill -HUP $(pidof dns-ligase)
 
 ## Testing
 
-Unit tests:
+Unit and lifecycle integration tests, lint, and release build:
 
 ```bash
-cargo test
+cargo test --locked
+cargo clippy --locked --all-targets -- -D warnings
+cargo build --locked --release
 ```
+
+The tests use local mock resolvers/list servers to cover DNS wire edge cases, response matching and deadlines, CNAME allow precedence, one query-log decision, congested/unavailable journald, list/cache failures, startup readiness, reload races and rollback, timer/cache-path changes, descriptor exhaustion, streamed stats and child cleanup. They do not change the host's DNS settings or require the live LAN resolver.
 
 End-to-end, with the server running:
 
@@ -250,8 +271,8 @@ dig @127.0.0.1 -p 5354 cloudflare.com +dnssec
 # DO bit injection: no +dnssec from the client, but RRSIGs should still appear
 dig @127.0.0.1 -p 5354 cloudflare.com
 
-# unsigned zone control: no ad flag and no RRSIG is the CORRECT result here
-dig @127.0.0.1 -p 5354 cbc.ca +dnssec
+# DNSSEC validation failure: expect SERVFAIL through proxy and unbound
+dig @127.0.0.1 -p 5354 dnssec-failed.org
 ```
 
 Compare any of these against querying your unbound directly — the outputs should match.
@@ -259,9 +280,11 @@ Compare any of these against querying your unbound directly — the outputs shou
 Health check:
 
 ```bash
-systemctl show dns-ligase -p MemoryCurrent   # expect well under 100 MB
+systemctl show dns-ligase -p MemoryCurrent
 journalctl -u dns-ligase -f
 ```
+
+Measure memory with your configured lists. A refresh temporarily holds both the active and replacement rules; in-flight queries can briefly retain the old snapshot after publication.
 
 ## Known issues
 

@@ -1,18 +1,15 @@
-//! `dns-ligase stats` subcommand: reads query logs from journald and prints
-//! them in a human-readable format with optional filtering.
-//!
-//! Query logs are written by `journald.rs` with structured fields:
-//! `QUERY_SOURCE`, `QUERY_DOMAIN`, `QUERY_QTYPE`, `QUERY_ACTION`, `QUERY_RULE`.
-//! This subcommand shells out to `journalctl --output=json`, parses the JSON
-//! with `serde_json` (already a dependency), and filters in-process.
-
+//! Journal query output is read incrementally; summaries retain only counts.
 use std::cmp::Reverse;
-use std::collections::HashMap;
-use std::process::Command;
+use std::collections::{BTreeSet, HashMap};
+use std::io::{self, BufRead, BufReader, Write};
+use std::process::{Command, Stdio};
 
 use serde::Deserialize;
 
-/// One parsed journal entry with query fields extracted.
+#[cfg(test)]
+#[path = "stats_stream_tests.rs"]
+mod stream_tests;
+
 #[derive(Debug, Clone)]
 pub struct QueryEntry {
     pub timestamp: String,
@@ -23,7 +20,6 @@ pub struct QueryEntry {
     pub rule: String,
 }
 
-/// Raw journald JSON entry — only the fields we care about.
 #[derive(Debug, Deserialize)]
 struct JournalEntry {
     #[serde(rename = "__REALTIME_TIMESTAMP")]
@@ -40,7 +36,6 @@ struct JournalEntry {
     rule: Option<String>,
 }
 
-/// Filter flags for `run_stats`.
 #[derive(Debug, Default)]
 pub struct StatsFilter {
     pub blocked: bool,
@@ -52,30 +47,52 @@ pub struct StatsFilter {
     pub summary: bool,
 }
 
-/// Parse a stream of JSON objects (one per line, as journalctl --output=json
-/// produces) into `QueryEntry` records.
-pub fn parse_entries(json_lines: &str) -> Vec<QueryEntry> {
-    let mut entries = Vec::new();
-    for line in json_lines.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Ok(raw) = serde_json::from_str::<JournalEntry>(line) {
-            // Skip entries that don't have query fields (operational logs).
-            if raw.action.is_none() && raw.domain.is_none() {
-                continue;
-            }
-            entries.push(QueryEntry {
-                timestamp: format_timestamp(raw.timestamp.as_deref()),
-                source: raw.source.unwrap_or_default(),
-                domain: raw.domain.unwrap_or_default(),
-                qtype: raw.qtype.unwrap_or_default(),
-                action: raw.action.unwrap_or_default(),
-                rule: raw.rule.unwrap_or_default(),
-            });
-        }
+impl StatsFilter {
+    fn matches(&self, entry: &QueryEntry) -> bool {
+        let any_action = self.blocked || self.allowed || self.forwarded;
+        (!any_action
+            || (self.blocked && entry.action == "blocked")
+            || (self.allowed && entry.action == "allowed")
+            || (self.forwarded && entry.action == "forwarded"))
+            && self
+                .domain
+                .as_ref()
+                .is_none_or(|domain| entry.domain.contains(domain))
+            && self
+                .src
+                .as_ref()
+                .is_none_or(|source| entry.source.contains(source))
     }
+}
+
+fn parse_entry(line: &str) -> Option<QueryEntry> {
+    let raw: JournalEntry = serde_json::from_str(line).ok()?;
+    if raw.action.is_none() && raw.domain.is_none() {
+        return None;
+    }
+    Some(QueryEntry {
+        timestamp: format_timestamp(raw.timestamp.as_deref()),
+        source: raw.source.unwrap_or_default(),
+        domain: raw.domain.unwrap_or_default(),
+        qtype: raw.qtype.unwrap_or_default(),
+        action: raw.action.unwrap_or_default(),
+        rule: raw.rule.unwrap_or_default(),
+    })
+}
+
+/// Collection helpers retained for library callers. The CLI reads one line at
+/// a time and does not build an in-memory list of journal entries.
+#[allow(dead_code)]
+pub fn parse_entries(json_lines: &str) -> Vec<QueryEntry> {
+    json_lines.lines().filter_map(parse_entry).collect()
+}
+
+#[allow(dead_code)]
+pub fn filter_entries(entries: Vec<QueryEntry>, filter: &StatsFilter) -> Vec<QueryEntry> {
     entries
+        .into_iter()
+        .filter(|entry| filter.matches(entry))
+        .collect()
 }
 
 /// Convert journald's microsecond timestamp to a readable `YYYY-MM-DD HH:MM:SS`.
@@ -117,124 +134,188 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
     (y as u64, m, d)
 }
 
-/// Filter entries according to the given flags.
-pub fn filter_entries(entries: Vec<QueryEntry>, f: &StatsFilter) -> Vec<QueryEntry> {
-    let any_action = f.blocked || f.allowed || f.forwarded;
-    entries
-        .into_iter()
-        .filter(|e| {
-            if any_action {
-                let action_match = (f.blocked && e.action == "blocked")
-                    || (f.allowed && e.action == "allowed")
-                    || (f.forwarded && e.action == "forwarded");
-                if !action_match {
-                    return false;
-                }
-            }
-            if let Some(ref d) = f.domain {
-                if !e.domain.contains(d) {
-                    return false;
-                }
-            }
-            if let Some(ref s) = f.src {
-                if !e.source.contains(s) {
-                    return false;
-                }
-            }
-            true
-        })
-        .collect()
+#[derive(Default)]
+struct Summary {
+    total: usize,
+    by_action: HashMap<String, usize>,
+    blocked_domains: HashMap<String, usize>,
+    by_source: HashMap<String, usize>,
 }
 
-/// Print entries as a formatted table, one per line.
-pub fn print_entries(entries: &[QueryEntry]) {
-    if entries.is_empty() {
-        println!("No matching entries.");
-        return;
-    }
-    println!("TIMESTAMP             SOURCE          TYPE   ACTION     DOMAIN                              RULE");
-    println!("{}", "-".repeat(100));
-    for e in entries {
-        println!(
-            "{:<20} {:<15} {:<6} {:<10} {:<32} {}",
-            e.timestamp, e.source, e.qtype, e.action, e.domain, e.rule
-        );
-    }
-}
-
-/// Print a summary: totals by action, top blocked domains, top sources.
-pub fn print_summary(entries: &[QueryEntry]) {
-    if entries.is_empty() {
-        println!("No matching entries.");
-        return;
-    }
-
-    let mut by_action: HashMap<&str, usize> = HashMap::new();
-    let mut blocked_domains: HashMap<&str, usize> = HashMap::new();
-    let mut by_source: HashMap<&str, usize> = HashMap::new();
-
-    for e in entries {
-        *by_action.entry(e.action.as_str()).or_default() += 1;
-        if e.action == "blocked" {
-            *blocked_domains.entry(e.domain.as_str()).or_default() += 1;
+impl Summary {
+    fn add(&mut self, entry: QueryEntry) {
+        self.total += 1;
+        if entry.action == "blocked" {
+            *self.blocked_domains.entry(entry.domain).or_default() += 1;
         }
-        *by_source.entry(e.source.as_str()).or_default() += 1;
+        *self.by_action.entry(entry.action).or_default() += 1;
+        *self.by_source.entry(entry.source).or_default() += 1;
     }
 
-    println!("Total queries: {}", entries.len());
-    println!();
-    println!("By action:");
-    for (action, count) in by_action {
-        println!("  {:<12} {}", action, count);
-    }
-
-    println!();
-    println!("Top 10 blocked domains:");
-    let mut top_blocked: Vec<_> = blocked_domains.into_iter().collect();
-    top_blocked.sort_by_key(|(_, c)| Reverse(*c));
-    for (i, (domain, count)) in top_blocked.iter().take(10).enumerate() {
-        println!("  {:<2}. {:<40} {}", i + 1, domain, count);
-    }
-
-    println!();
-    println!("Top 10 sources:");
-    let mut top_sources: Vec<_> = by_source.into_iter().collect();
-    top_sources.sort_by_key(|(_, c)| Reverse(*c));
-    for (i, (source, count)) in top_sources.iter().take(10).enumerate() {
-        println!("  {:<2}. {:<40} {}", i + 1, source, count);
+    fn write(self, output: &mut impl Write) -> io::Result<()> {
+        if self.total == 0 {
+            return writeln!(output, "No matching entries.");
+        }
+        writeln!(output, "Total queries: {}\n\nBy action:", self.total)?;
+        let mut actions: Vec<_> = self.by_action.into_iter().collect();
+        actions.sort_by(|a, b| a.0.cmp(&b.0));
+        for (action, count) in actions {
+            writeln!(output, "  {action:<12} {count}")?;
+        }
+        write_top(output, "Top 10 blocked domains:", self.blocked_domains)?;
+        write_top(output, "Top 10 sources:", self.by_source)
     }
 }
 
-/// Run the stats subcommand: invoke journalctl, parse, filter, print.
-pub fn run_stats(filter: StatsFilter) -> Result<(), Box<dyn std::error::Error>> {
-    let mut cmd = Command::new("journalctl");
-    cmd.arg("-u").arg("dns-ligase");
-    cmd.arg("--output=json");
-    cmd.arg("--no-pager");
-    if let Some(ref since) = filter.since {
-        cmd.arg("--since").arg(since);
+fn write_top(
+    output: &mut impl Write,
+    title: &str,
+    counts: HashMap<String, usize>,
+) -> io::Result<()> {
+    // Keep only ten candidates rather than allocating/sorting another complete
+    // copy of the distinct-domain/source maps. Ties use the name for stability.
+    let mut top = BTreeSet::new();
+    for (name, count) in counts {
+        top.insert((Reverse(count), name));
+        if top.len() > 10 {
+            top.pop_last();
+        }
     }
-    // Only query log entries have QUERY_ACTION; journalctl can't filter on
-    // arbitrary fields, so we pull everything and filter in-process.
-
-    let output = cmd.output()?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("journalctl failed: {stderr}").into());
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let entries = parse_entries(&stdout);
-    let filtered = filter_entries(entries, &filter);
-
-    if filter.summary {
-        print_summary(&filtered);
-    } else {
-        print_entries(&filtered);
+    writeln!(output, "\n{title}")?;
+    for (i, (Reverse(count), name)) in top.into_iter().enumerate() {
+        writeln!(output, "  {:<2}. {:<40} {}", i + 1, name, count)?;
     }
     Ok(())
 }
 
+fn write_header(output: &mut impl Write) -> io::Result<()> {
+    writeln!(output, "TIMESTAMP             SOURCE          TYPE   ACTION     DOMAIN                              RULE")?;
+    writeln!(output, "{}", "-".repeat(100))
+}
+fn write_entry(output: &mut impl Write, entry: &QueryEntry) -> io::Result<()> {
+    writeln!(
+        output,
+        "{:<20} {:<15} {:<6} {:<10} {:<32} {}",
+        entry.timestamp, entry.source, entry.qtype, entry.action, entry.domain, entry.rule
+    )
+}
+
+#[allow(dead_code)]
+pub fn print_entries(entries: &[QueryEntry]) {
+    let mut output = io::stdout().lock();
+    if entries.is_empty() {
+        let _ = writeln!(output, "No matching entries.");
+        return;
+    }
+    if write_header(&mut output).is_err() {
+        return;
+    }
+    for entry in entries {
+        if write_entry(&mut output, entry).is_err() {
+            return;
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub fn print_summary(entries: &[QueryEntry]) {
+    let mut summary = Summary::default();
+    for entry in entries.iter().cloned() {
+        summary.add(entry);
+    }
+    let _ = summary.write(&mut io::stdout().lock());
+}
+
+fn read_entries(
+    mut reader: impl BufRead,
+    filter: &StatsFilter,
+    output: &mut impl Write,
+) -> io::Result<Summary> {
+    let mut summary = Summary::default();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        let Some(entry) = parse_entry(&line).filter(|entry| filter.matches(entry)) else {
+            continue;
+        };
+        if filter.summary {
+            summary.add(entry);
+        } else {
+            if summary.total == 0 {
+                write_header(output)?;
+            }
+            write_entry(output, &entry)?;
+            summary.total += 1;
+        }
+    }
+    Ok(summary)
+}
+
+fn journal_command(filter: &StatsFilter) -> Command {
+    let mut command = Command::new("journalctl");
+    command.args(["-u", "dns-ligase", "--output=json", "--no-pager"]);
+    if let Some(since) = &filter.since {
+        command.arg("--since").arg(since);
+    }
+    // Multiple matches for the same journal field are alternatives (OR).
+    for (selected, action) in [
+        (filter.blocked, "blocked"),
+        (filter.allowed, "allowed"),
+        (filter.forwarded, "forwarded"),
+    ] {
+        if selected {
+            command.arg(format!("QUERY_ACTION={action}"));
+        }
+    }
+    // Domain/source retain their existing substring semantics in-process.
+    command
+}
+
+fn run_command(
+    mut command: Command,
+    filter: &StatsFilter,
+    output: &mut impl Write,
+) -> io::Result<()> {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+    let reader = BufReader::new(child.stdout.take().expect("piped journal stdout"));
+    let result = read_entries(reader, filter, output);
+    let summary = match result {
+        Ok(summary) => summary,
+        Err(error) => {
+            // A closed output pipe or read error must not leave journalctl
+            // running. stderr is inherited so it cannot fill an unread pipe.
+            let _ = child.kill();
+            let _ = child.wait();
+            return if error.kind() == io::ErrorKind::BrokenPipe {
+                Ok(())
+            } else {
+                Err(error)
+            };
+        }
+    };
+    let status = child.wait()?;
+    if !status.success() {
+        return Err(io::Error::other(format!("journalctl failed: {status}")));
+    }
+    if filter.summary {
+        summary.write(output)
+    } else if summary.total == 0 {
+        writeln!(output, "No matching entries.")
+    } else {
+        Ok(())
+    }
+}
+
+pub fn run_stats(filter: StatsFilter) -> Result<(), Box<dyn std::error::Error>> {
+    run_command(journal_command(&filter), &filter, &mut io::stdout().lock())?;
+    Ok(())
+}
 #[cfg(test)]
 mod tests {
     use super::*;

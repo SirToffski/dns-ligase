@@ -8,11 +8,15 @@ arch=('x86_64')
 url='https://github.com/SirToffski/dns-ligase'
 license=('MIT')
 depends=('gcc-libs' 'openssl')
-makedepends=('cargo')
-source=("$_pkgname::git+https://github.com/SirToffski/dns-ligase.git")
+makedepends=('cargo' 'git')
+# CI/local review builds can pin the selected checkout without fetching main.
+_source_url="${DNS_LIGASE_SOURCE:-git+https://github.com/SirToffski/dns-ligase.git}"
+source=("$_pkgname::$_source_url")
 sha256sums=('SKIP')
 backup=('etc/dns-ligase/config.toml')
-options=(!debug)
+# mimalloc contains C code; makepkg's GCC LTO objects can fail when Cargo
+# links with Clang. Keep Rust's ThinLTO from Cargo.toml, disable C/C++ LTO.
+options=(!debug !lto)
 
 pkgver() {
     cd "$srcdir/$_pkgname"
@@ -29,9 +33,15 @@ build() {
     cargo build --release --locked --bin dns-ligase
 }
 
+check() {
+    cd "$srcdir/$_pkgname"
+    cargo test --locked
+}
+
 package() {
     cd "$srcdir/$_pkgname"
     install -Dm755 target/release/dns-ligase "$pkgdir/usr/bin/dns-ligase"
     install -Dm644 systemd/dns-ligase.service "$pkgdir/usr/lib/systemd/system/dns-ligase.service"
     install -Dm644 config.toml "$pkgdir/etc/dns-ligase/config.toml"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }

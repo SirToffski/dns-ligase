@@ -57,15 +57,15 @@ fn run_stats_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             "--summary" => filter.summary = true,
             "--domain" | "-d" => {
                 i += 1;
-                filter.domain = args.get(i).cloned();
+                filter.domain = Some(stats_value(args, i, "--domain")?);
             }
             "--src" | "-s" => {
                 i += 1;
-                filter.src = args.get(i).cloned();
+                filter.src = Some(stats_value(args, i, "--src")?);
             }
             "--since" => {
                 i += 1;
-                filter.since = args.get(i).cloned();
+                filter.since = Some(stats_value(args, i, "--since")?);
             }
             "--help" | "-h" => {
                 println!("Usage: dns-ligase stats [OPTIONS]");
@@ -91,4 +91,15 @@ fn run_stats_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         i += 1;
     }
     stats::run_stats(filter)
+}
+
+fn stats_value(
+    args: &[String],
+    index: usize,
+    flag: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    args.get(index)
+        .filter(|value| !value.starts_with("--"))
+        .cloned()
+        .ok_or_else(|| format!("{flag} requires a value").into())
 }

@@ -20,6 +20,9 @@ jobs:
           pacman -Syu --noconfirm git rust
 
       - uses: actions/checkout@v4
+        with:
+          # pkgver uses the commit count, so retain the full selected history.
+          fetch-depth: 0
 
       - name: Create build user
         run: |
@@ -30,7 +33,10 @@ jobs:
       - name: Build package
         run: |
           cd PKGBUILD
-          sudo -u builder makepkg -s --noconfirm
+          sudo -u builder env \
+            DNS_LIGASE_SOURCE="git+file://${GITHUB_WORKSPACE}#commit=${GITHUB_SHA}" \
+            makepkg -s --check --noconfirm
+          test "$(sudo -u builder git -C src/dns-ligase rev-parse HEAD)" = "$GITHUB_SHA"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -38,3 +44,4 @@ jobs:
           name: dns-ligase-pkg
           path: PKGBUILD/*.pkg.tar.zst
           retention-days: 30
+          if-no-files-found: error
