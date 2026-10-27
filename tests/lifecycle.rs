@@ -21,6 +21,7 @@ struct App {
     port: u16,
     upstream_port: u16,
     urls: Vec<String>,
+    regex_allow_urls: Vec<String>,
     blocked: Vec<String>,
     interval: u64,
     cache_path: PathBuf,
@@ -46,6 +47,7 @@ impl App {
             port,
             upstream_port,
             urls: vec![],
+            regex_allow_urls: vec![],
             blocked: vec![],
             interval: 3600,
             child: None,
@@ -64,6 +66,7 @@ port={}
 use_tcp=false
 [blocklists]
 urls={}
+regex_allow_urls={}
 refresh_interval_secs={}
 cache_ttl_secs=0
 [matching]
@@ -79,6 +82,7 @@ queries=false
             self.port,
             self.upstream_port,
             serde_json::to_string(&self.urls).unwrap(),
+            serde_json::to_string(&self.regex_allow_urls).unwrap(),
             self.interval,
             serde_json::to_string(&self.blocked).unwrap(),
             serde_json::to_string(self.cache_path.to_str().unwrap()).unwrap()
@@ -278,6 +282,14 @@ impl Http {
     }
 }
 async fn http(hold: Option<usize>) -> Http {
+    http_body(hold, "old.list\n").await
+}
+
+async fn http_body(hold: Option<usize>, body: &str) -> Http {
+    let response = Arc::new(format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    ));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!(
         "http://127.0.0.1:{}/list",
@@ -293,6 +305,7 @@ async fn http(hold: Option<usize>) -> Http {
                 accepted = listener.accept() => {
                     let (mut stream, _) = accepted.unwrap();
                     let (counter, gate) = (counter.clone(), gate.clone());
+                    let response = response.clone();
                     handlers.spawn(async move {
                         let mut request = Vec::new();
                         let mut buf = [0; 1024];
@@ -303,7 +316,7 @@ async fn http(hold: Option<usize>) -> Http {
                         }
                         let number = counter.fetch_add(1, Ordering::SeqCst) + 1;
                         if hold == Some(number) { gate.acquire().await.unwrap().forget(); }
-                        let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\nold.list\n").await;
+                        let _ = stream.write_all(response.as_bytes()).await;
                     });
                 },
                 Some(result) = handlers.join_next() => { result.unwrap(); },
@@ -646,4 +659,30 @@ async fn timeout_connect(port: u16) -> TcpStream {
     .await
     .unwrap()
     .unwrap()
+}
+
+#[tokio::test]
+async fn regex_list_diagnostics_include_url_line_and_summary() {
+    let upstream = dns(false).await;
+    let list = http_body(None, "# comment\n^safe\\.test$\n^(?!bad)skip$\n[invalid\n").await;
+    let mut app = App::new(upstream.port);
+    app.regex_allow_urls.push(list.url.clone());
+    app.blocked.push("safe.test".into());
+    app.start();
+    app.wait_log("Initial remote refresh completed.").await;
+    let log = app.log();
+    assert!(
+        log.contains(&format!("{}:3: skipping invalid regex", list.url)),
+        "{log}"
+    );
+    assert!(
+        log.contains(&format!("{}:4: skipping invalid regex", list.url)),
+        "{log}"
+    );
+    assert!(
+        log.contains("compiled 1 regexes, skipped 2 invalid patterns"),
+        "{log}"
+    );
+    assert_eq!(rcode(&app.udp("safe.test").await.unwrap()), 0);
+    app.stop().await;
 }

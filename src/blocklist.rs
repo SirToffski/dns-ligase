@@ -4,7 +4,10 @@ use std::fs;
 use std::io::{self, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 use std::time::{Duration, SystemTime};
 
 use regex::Regex;
@@ -57,14 +60,7 @@ impl Blocklist {
 
         match format {
             ListFormat::Hosts | ListFormat::PiHole => {
-                if let Some(domain) = Self::clean_domain_static(line) {
-                    let domain = domain.to_lowercase();
-                    if as_allow {
-                        self.allow_domains.insert(domain);
-                    } else {
-                        self.block_domains.insert(domain);
-                    }
-                }
+                self.parse_host_line(line, as_allow);
             }
             ListFormat::AdBlock | ListFormat::AdGuard => {
                 let has_at = line.starts_with("@@");
@@ -96,7 +92,13 @@ impl Blocklist {
                         self.block_suffixes.insert(domain);
                     }
                 } else if pattern_part.starts_with('/') && pattern_part.ends_with('/') {
-                    let pattern = &pattern_part[1..pattern_part.len() - 1];
+                    let pattern = pattern_part
+                        .strip_prefix('/')
+                        .and_then(|s| s.strip_suffix('/'))
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::InvalidInput, "Empty regex delimiter")
+                        })?;
                     let re = Regex::new(pattern)?;
                     if is_allow {
                         self.allow_regex.push(re);
@@ -104,14 +106,7 @@ impl Blocklist {
                         self.block_regex.push(re);
                     }
                 } else {
-                    if let Some(domain) = Self::clean_domain_static(pattern_part) {
-                        let domain_lower = domain.to_lowercase();
-                        if is_allow {
-                            self.allow_domains.insert(domain_lower);
-                        } else {
-                            self.block_domains.insert(domain_lower);
-                        }
-                    }
+                    self.parse_host_line(pattern_part, is_allow);
                 }
             }
         }
@@ -130,7 +125,10 @@ impl Blocklist {
             return Ok(());
         }
 
-        if line.starts_with("||") || line.starts_with("@@") || (line.starts_with('/') && line.ends_with('/')) {
+        if line.starts_with("||")
+            || line.starts_with("@@")
+            || (line.starts_with('/') && line.ends_with('/'))
+        {
             self.parse_line_mode(line, ListFormat::AdBlock, as_allow)
         } else {
             self.parse_line_mode(line, ListFormat::Hosts, as_allow)
@@ -138,9 +136,20 @@ impl Blocklist {
     }
 
     #[allow(dead_code)]
-    pub async fn fetch_and_parse(&mut self, url: &str, format: Option<ListFormat>, upstream: Arc<Upstream>) -> Result<(), Box<dyn Error>> {
-        let content = list_client_builder(upstream).build()?
-            .get(url).send().await?.error_for_status()?.text().await?;
+    pub async fn fetch_and_parse(
+        &mut self,
+        url: &str,
+        format: Option<ListFormat>,
+        upstream: Arc<Upstream>,
+    ) -> Result<(), Box<dyn Error>> {
+        let content = list_client_builder(upstream)
+            .build()?
+            .get(url)
+            .send()
+            .await?
+            .error_for_status()?
+            .text()
+            .await?;
         for line in content.lines() {
             match format {
                 Some(f) => self.parse_line(line, f)?,
@@ -166,31 +175,44 @@ impl Blocklist {
         None
     }
 
-    fn clean_domain_static(domain: &str) -> Option<String> {
+    fn parse_host_line(&mut self, line: &str, as_allow: bool) {
         // AdBlock/uBO cosmetic and scriptlet rules (##, #$#, #@#, #?#) are not
         // DNS rules. Without this guard a line like `example.com##.ad` would be
         // truncated at '#' below and misparsed as a bare-domain block for the
         // whole domain. A hosts file never legitimately contains these markers.
-        if domain.contains("##")
-            || domain.contains("#$#")
-            || domain.contains("#@#")
-            || domain.contains("#?#")
+        if line.contains("##")
+            || line.contains("#$#")
+            || line.contains("#@#")
+            || line.contains("#?#")
         {
-            return None;
+            return;
         }
-        let domain = domain.split('#').next()?.trim();
-        if domain.is_empty() {
-            return None;
-        }
-
-        let parts: Vec<&str> = domain.split_whitespace().collect();
-        let target = if parts.len() > 1 {
-            parts.last().unwrap()
-        } else {
-            parts[0]
+        let mut parts = line.split('#').next().unwrap_or("").split_whitespace();
+        let Some(first) = parts.next() else {
+            return;
         };
+        let set = if as_allow {
+            &mut self.allow_domains
+        } else {
+            &mut self.block_domains
+        };
+        if first.parse::<IpAddr>().is_ok() {
+            for domain in parts {
+                if let Some(domain) = Self::clean_domain_static(domain) {
+                    set.insert(domain.to_lowercase());
+                }
+            }
+        } else if parts.next().is_none() {
+            // Bare-domain entries contain one token. Arbitrary trailing prose
+            // must not become a hostname rule.
+            if let Some(domain) = Self::clean_domain_static(first) {
+                set.insert(domain.to_lowercase());
+            }
+        }
+    }
 
-        let cleaned = target.trim_end_matches('.');
+    fn clean_domain_static(domain: &str) -> Option<&str> {
+        let cleaned = domain.trim_end_matches('.');
         if cleaned.is_empty() {
             return None;
         }
@@ -204,7 +226,7 @@ impl Blocklist {
         {
             return None;
         }
-        Some(cleaned.to_string())
+        Some(cleaned)
     }
 
     #[allow(dead_code)]
@@ -262,57 +284,107 @@ pub enum MatchOutcome {
     Forwarded,
 }
 
-/// Parse lines from a blocklist body into an existing Blocklist.
-/// This is used by the cache reload path to merge a single URL's content.
-pub fn parse_lines_into(bl: &mut Blocklist, body: &str) {
-    for line in body.lines() {
-        let _ = bl.parse_auto(line);
+/// Parse ordinary list bodies, preserving source/line context for bad rules.
+pub fn parse_lines_into(bl: &mut Blocklist, body: &str, source: &str) {
+    parse_domain_lines(bl, body, false, source);
+}
+
+pub fn parse_lines_into_allow(bl: &mut Blocklist, body: &str, source: &str) {
+    parse_domain_lines(bl, body, true, source);
+}
+
+const MAX_RULE_WARNINGS: usize = 10;
+
+fn parse_domain_lines(bl: &mut Blocklist, body: &str, as_allow: bool, source: &str) {
+    let mut skipped = 0;
+    for (line_number, line) in body.lines().enumerate() {
+        if let Err(error) = bl.parse_auto_mode(line, as_allow) {
+            skipped += 1;
+            if skipped <= MAX_RULE_WARNINGS {
+                log::warn!(
+                    "{source}:{}: skipping invalid rule {line:?}: {error}",
+                    line_number + 1
+                );
+            }
+        }
+    }
+    if skipped != 0 {
+        log::warn!("{source}: skipped {skipped} invalid rules");
     }
 }
 
-/// Parse lines from an allowlist body, routing every entry to the allow sets.
-pub fn parse_lines_into_allow(bl: &mut Blocklist, body: &str) {
-    for line in body.lines() {
-        let _ = bl.parse_auto_mode(line, true);
-    }
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct RegexParseCounts {
+    pub compiled: usize,
+    pub skipped: usize,
 }
 
-/// Parse lines from a regex-list body, compiling every pattern into the block
-/// or allow regex set. Expected format is one pattern per line (as in Pi-hole
-/// regex lists), with optional ` -- comment` trailers and optional `/.../`
-/// wrapping. Uncompilable lines are skipped.
-pub fn parse_lines_into_regex(bl: &mut Blocklist, body: &str, as_allow: bool) {
-    for line in body.lines() {
+/// Compile one pattern per line, accepting Pi-hole comment trailers and /.../
+/// wrapping. Unsupported regexes are counted and reported, never broadened.
+pub fn parse_lines_into_regex(
+    bl: &mut Blocklist,
+    body: &str,
+    as_allow: bool,
+    source: &str,
+) -> RegexParseCounts {
+    let mut counts = RegexParseCounts::default();
+    for (line_number, line) in body.lines().enumerate() {
         let line = line.trim();
-        if line.is_empty() || line.starts_with('#') || line.starts_with('!') || line.starts_with("--") {
+        if line.is_empty()
+            || line.starts_with('#')
+            || line.starts_with('!')
+            || line.starts_with("--")
+        {
             continue;
         }
-        // Pi-hole style trailing comment: `pattern -- description`. Split on
-        // ` -- ` (with spaces) — a literal space can never occur in a QNAME,
-        // so no workable pattern is harmed by this.
         let pattern = line.split(" -- ").next().unwrap_or("").trim();
         if pattern.is_empty() {
             continue;
         }
-        // Tolerate AdBlock-style /.../ wrapping.
-        let pattern = pattern
-            .strip_prefix('/')
-            .and_then(|s| s.strip_suffix('/'))
-            .unwrap_or(pattern);
-        if pattern.is_empty() {
-            continue;
-        }
-        match Regex::new(pattern) {
+        let wrapped = pattern.starts_with('/') && pattern.ends_with('/');
+        let pattern = if wrapped {
+            pattern
+                .strip_prefix('/')
+                .and_then(|s| s.strip_suffix('/'))
+                .unwrap_or("")
+        } else {
+            pattern
+        };
+        let compiled = if pattern.is_empty() {
+            Err("empty regex delimiter".to_string())
+        } else {
+            Regex::new(pattern).map_err(|e| e.to_string())
+        };
+        match compiled {
             Ok(re) => {
+                counts.compiled += 1;
                 if as_allow {
                     bl.allow_regex.push(re);
                 } else {
                     bl.block_regex.push(re);
                 }
             }
-            Err(_) => continue, // skip uncompilable lines, like other parsers
+            Err(error) => {
+                counts.skipped += 1;
+                if counts.skipped <= MAX_RULE_WARNINGS {
+                    log::warn!(
+                        "{source}:{}: skipping invalid regex {line:?}: {error}",
+                        line_number + 1
+                    );
+                }
+            }
         }
     }
+    if counts.skipped != 0 {
+        log::warn!(
+            "{source}: compiled {} regexes, skipped {} invalid patterns",
+            counts.compiled,
+            counts.skipped
+        );
+    } else {
+        log::info!("{source}: compiled {} regexes", counts.compiled);
+    }
+    counts
 }
 
 /// Merge source blocklist into target.
@@ -335,7 +407,7 @@ pub fn merge_blocklist(target: &mut Blocklist, source: Blocklist) {
 /// never held in RAM after parsing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedList {
-    pub fetched_at: u64,  // Unix timestamp (seconds)
+    pub fetched_at: u64, // Unix timestamp (seconds)
     pub etag: Option<String>,
     /// Body file name, relative to the bodies directory. Derived from the URL.
     pub filename: String,
@@ -410,12 +482,15 @@ impl reqwest::dns::Resolve for ListResolver {
         Box::pin(async move {
             let ips = upstream.resolve_a(name.as_str()).await?;
             if ips.is_empty() {
-                return Err(io::Error::new(io::ErrorKind::NotFound,
-                    format!("No upstream A records for {name}")).into());
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("No upstream A records for {name}"),
+                )
+                .into());
             }
             // reqwest substitutes the URL's port for zero.
-            let addrs: reqwest::dns::Addrs = Box::new(ips.into_iter()
-                .map(|ip| SocketAddr::new(IpAddr::V4(ip), 0)));
+            let addrs: reqwest::dns::Addrs =
+                Box::new(ips.into_iter().map(|ip| SocketAddr::new(IpAddr::V4(ip), 0)));
             Ok(addrs)
         })
     }
@@ -476,7 +551,12 @@ async fn download_one(
     cache_path: &str,
 ) -> DownloadResult {
     // The deadline includes a possible second GET after a missing-body 304.
-    match tokio::time::timeout(LIST_REQUEST_TIMEOUT, download_response(url, etag, client, cache_path)).await {
+    match tokio::time::timeout(
+        LIST_REQUEST_TIMEOUT,
+        download_response(url, etag, client, cache_path),
+    )
+    .await
+    {
         Ok(Ok(result)) => result,
         Ok(Err(error)) => stale_or_failed(url, cache_path, error),
         Err(_) => stale_or_failed(url, cache_path, "List download deadline exceeded".into()),
@@ -491,19 +571,29 @@ fn stale_or_failed(url: &str, cache_path: &str, error: String) -> DownloadResult
 }
 
 async fn download_response(
-    url: &str, etag: Option<&str>, client: &reqwest::Client, cache_path: &str,
+    url: &str,
+    etag: Option<&str>,
+    client: &reqwest::Client,
+    cache_path: &str,
 ) -> Result<DownloadResult, String> {
     let mut request = client.get(url);
     if let Some(etag) = etag {
         request = request.header(reqwest::header::IF_NONE_MATCH, etag);
     }
-    let mut resp = request.send().await.map_err(|e| format!("request failed: {e}"))?;
+    let mut resp = request
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
     if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
         if read_body_file(cache_path, &url_to_filename(url)).is_some() {
             return Ok(DownloadResult::NotModified);
         }
         log::warn!("304 for {url} but body file missing; refetching");
-        resp = client.get(url).send().await.map_err(|e| format!("refetch failed: {e}"))?;
+        resp = client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| format!("refetch failed: {e}"))?;
     }
     if resp.status() != reqwest::StatusCode::OK {
         return Err(format!("HTTP {}", resp.status()));
@@ -517,14 +607,27 @@ static TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Replace a cache file only after its complete contents reach disk.
 fn atomic_write(path: &Path, data: &[u8]) -> io::Result<()> {
-    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
     fs::create_dir_all(parent)?;
-    let filename = path.file_name().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Missing cache filename"))?;
+    let filename = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Missing cache filename"))?;
     let (temp_path, mut file) = loop {
         let id = TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed);
-        let name = format!(".{}.{}.{id}.tmp", filename.to_string_lossy(), std::process::id());
+        let name = format!(
+            ".{}.{}.{id}.tmp",
+            filename.to_string_lossy(),
+            std::process::id()
+        );
         let temp_path = parent.join(name);
-        match fs::OpenOptions::new().write(true).create_new(true).open(&temp_path) {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
             Ok(file) => break (temp_path, file),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
@@ -545,11 +648,16 @@ fn atomic_write(path: &Path, data: &[u8]) -> io::Result<()> {
 impl CachedLists {
     /// Usable cached bodies, regardless of age, for serving during startup.
     pub fn cached_bodies(&self, urls: &[String], cache_path: &str) -> HashMap<String, String> {
-        urls.iter().filter_map(|url| {
-            let filename = self.map.get(url).map(|entry| entry.filename.clone())
-                .unwrap_or_else(|| url_to_filename(url));
-            read_body_file(cache_path, &filename).map(|body| (url.clone(), body))
-        }).collect()
+        urls.iter()
+            .filter_map(|url| {
+                let filename = self
+                    .map
+                    .get(url)
+                    .map(|entry| entry.filename.clone())
+                    .unwrap_or_else(|| url_to_filename(url));
+                read_body_file(cache_path, &filename).map(|body| (url.clone(), body))
+            })
+            .collect()
     }
 
     /// Prepare a new cache location without changing the active cache. Failed
@@ -560,7 +668,9 @@ impl CachedLists {
             let filename = url_to_filename(&url);
             migrated.write_body(new_path, &filename, &body)?;
             let mut entry = self.map.get(&url).cloned().unwrap_or(CachedList {
-                fetched_at: 0, etag: None, filename: filename.clone(),
+                fetched_at: 0,
+                etag: None,
+                filename: filename.clone(),
             });
             entry.filename = filename;
             migrated.map.insert(url, entry);
@@ -635,13 +745,21 @@ impl CachedLists {
         cache_path: &str,
         upstream: Arc<Upstream>,
     ) -> Vec<(String, DownloadResult)> {
-        if jobs.is_empty() { return Vec::new(); }
+        if jobs.is_empty() {
+            return Vec::new();
+        }
         let client = match list_client_builder(upstream).build() {
             Ok(client) => client,
-            Err(e) => return jobs.into_iter().map(|job| {
-                let result = stale_or_failed(&job.url, cache_path, format!("HTTP client: {e}"));
-                (job.url, result)
-            }).collect(),
+            Err(e) => {
+                return jobs
+                    .into_iter()
+                    .map(|job| {
+                        let result =
+                            stale_or_failed(&job.url, cache_path, format!("HTTP client: {e}"));
+                        (job.url, result)
+                    })
+                    .collect()
+            }
         };
         let cache_path = cache_path.to_string();
         let mut set = tokio::task::JoinSet::new();
@@ -688,11 +806,14 @@ impl CachedLists {
                         bodies.push((url, body));
                         continue;
                     }
-                    self.map.insert(url.clone(), CachedList {
-                        fetched_at: now,
-                        etag,
-                        filename,
-                    });
+                    self.map.insert(
+                        url.clone(),
+                        CachedList {
+                            fetched_at: now,
+                            etag,
+                            filename,
+                        },
+                    );
                     self.dirty = true;
                     bodies.push((url, body));
                 }
@@ -705,7 +826,9 @@ impl CachedLists {
                         if let Some(body) = read_body_file(cache_path, &filename) {
                             bodies.push((url, body));
                         } else {
-                            log::warn!("304 for {url} but body file missing; will refetch next cycle");
+                            log::warn!(
+                                "304 for {url} but body file missing; will refetch next cycle"
+                            );
                         }
                     } else {
                         // Entry vanished between plan and merge (e.g. URL removed
@@ -779,7 +902,6 @@ pub enum ListFormat {
     PiHole,
     AdGuard,
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -916,7 +1038,7 @@ mod tests {
 
         // Allowlist body in hosts format: bare domains become allow rules
         let body = "# allowlist\nexample.com\n0.0.0.0 safe.ads.com\n";
-        parse_lines_into_allow(&mut bl, body);
+        parse_lines_into_allow(&mut bl, body, "test-list");
 
         assert!(!bl.matches("example.com"), "allowlist entry should override");
         assert!(!bl.matches("safe.ads.com"), "allowlist should override block suffix");
@@ -930,7 +1052,7 @@ mod tests {
 
         // Allowlist body in AdBlock format: ||domain^ and /regex/ become allow rules
         let body = "||safe.ads.com^\n/^allow\\.me$/\n@@||redundant.ads.com^\n";
-        parse_lines_into_allow(&mut bl, body);
+        parse_lines_into_allow(&mut bl, body, "test-list");
 
         assert!(!bl.matches("safe.ads.com"), "|| suffix in allowlist should allow");
         assert!(!bl.matches("sub.safe.ads.com"), "subdomain of allow suffix");
@@ -1021,7 +1143,7 @@ mod tests {
                     # hash comment\n\
                     ! bang comment\n\
                     [invalid(regex -- skipped, must not poison the rest\n";
-        parse_lines_into_regex(&mut bl, body, false);
+        parse_lines_into_regex(&mut bl, body, false, "test-list");
         assert_eq!(bl.block_regex.len(), 2);
         assert!(bl.matches("ad-score.com"));
         assert!(bl.matches("eu.ad-score.com"));
@@ -1032,7 +1154,7 @@ mod tests {
     #[test]
     fn test_parse_lines_into_regex_unwraps_slashes() {
         let mut bl = Blocklist::new();
-        parse_lines_into_regex(&mut bl, "/^allow\\.me$/\n", true);
+        parse_lines_into_regex(&mut bl, "/^allow\\.me$/\n", true, "test-list");
         assert_eq!(bl.allow_regex.len(), 1);
         // Allow-via-URL beats an exact block, like any other allow rule.
         bl.parse_auto("allow.me").unwrap();
@@ -1043,7 +1165,7 @@ mod tests {
     fn test_parse_lines_into_regex_allow_only() {
         let mut bl = Blocklist::new();
         bl.parse_auto("||ads.com^").unwrap();
-        parse_lines_into_regex(&mut bl, "(\\.|^)safe\\.ads\\.com$ -- exception\n", true);
+        parse_lines_into_regex(&mut bl, "(\\.|^)safe\\.ads\\.com$ -- exception\n", true, "test-list");
         assert!(!bl.matches("safe.ads.com"));
         assert!(bl.matches("evil.ads.com"));
     }

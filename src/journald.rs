@@ -16,6 +16,7 @@
 
 use std::io;
 use std::os::unix::net::UnixDatagram;
+use std::path::Path;
 use std::sync::OnceLock;
 
 const JOURNAL_SOCKET: &str = "/run/systemd/journal/socket";
@@ -29,13 +30,7 @@ static JOURNAL_SOCK: OnceLock<Option<UnixDatagram>> = OnceLock::new();
 ///
 /// Silently does nothing if the journald socket is unavailable (e.g. running
 /// outside systemd), so this is safe to call unconditionally.
-pub fn log_query(
-    source: &str,
-    domain: &str,
-    qtype: &str,
-    action: &str,
-    rule: &str,
-) {
+pub fn log_query(source: &str, domain: &str, qtype: &str, action: &str, rule: &str) {
     // The native protocol frames fields with newlines, but DNS labels may
     // legally contain 0x0A/0x0D bytes — a crafted QNAME could otherwise inject
     // forged journal fields. ('=' inside a value is harmless: only the first
@@ -76,14 +71,26 @@ pub fn log_query(
 }
 
 fn send(entry: &str) -> io::Result<()> {
-    let socket = JOURNAL_SOCK.get_or_init(|| {
-        UnixDatagram::unbound()
-            .and_then(|s| s.connect(JOURNAL_SOCKET).map(|_| s))
-            .ok()
-    });
+    let socket = JOURNAL_SOCK.get_or_init(|| connect_socket(Path::new(JOURNAL_SOCKET)).ok());
     match socket {
-        Some(s) => s.send(entry.as_bytes()).map(|_| ()),
+        Some(s) => send_entry(s, entry),
         None => Ok(()),
+    }
+}
+
+fn connect_socket(path: &Path) -> io::Result<UnixDatagram> {
+    let socket = UnixDatagram::unbound()?;
+    socket.set_nonblocking(true)?;
+    socket.connect(path)?;
+    Ok(socket)
+}
+
+fn send_entry(socket: &UnixDatagram, entry: &str) -> io::Result<()> {
+    match socket.send(entry.as_bytes()) {
+        // Query logging is best-effort; congestion must not block DNS or
+        // recursively flood journald through operational error logs.
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(()),
+        result => result.map(|_| ()),
     }
 }
 
@@ -96,10 +103,46 @@ fn sanitize_field(s: &str) -> String {
         s.to_string()
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn full_journal_queue_is_best_effort_and_never_blocks() {
+        use std::sync::{atomic::{AtomicUsize, Ordering}, mpsc};
+        use std::time::Duration;
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!("dns-journal-{}-{}",std::process::id(),NEXT.fetch_add(1,Ordering::Relaxed)));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("socket");
+        let receiver = UnixDatagram::bind(&path).unwrap();
+        let socket = connect_socket(&path).unwrap();
+        let (tx,rx) = mpsc::channel();
+        let task = std::thread::spawn(move || {
+            for _ in 0..1024 {
+                match socket.send(&[b'x';8192]) {
+                    Ok(_) => {},
+                    Err(e) if e.kind()==io::ErrorKind::WouldBlock => {
+                        let _ = tx.send(send_entry(&socket,"QUERY_ACTION=blocked\n").is_ok());
+                        return;
+                    },
+                    Err(_) => break,
+                }
+            }
+            let _ = tx.send(false);
+        });
+        let result = rx.recv_timeout(Duration::from_secs(2));
+        drop(receiver); // also releases a buggy blocking sender before joining
+        task.join().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(result.unwrap());
+    }
+
+    #[test]
+    fn unavailable_journal_socket_returns_an_error() {
+        let path = std::env::temp_dir().join(format!("missing-dns-journal-{}",std::process::id()));
+        assert!(connect_socket(&path).is_err());
+    }
 
     #[test]
     fn test_log_query_does_not_panic_without_journald() {

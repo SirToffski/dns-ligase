@@ -89,14 +89,6 @@ fn manual_rules(config: &Config) -> io::Result<Blocklist> {
     };
     let mut bl = Blocklist::new();
     for entry in &config.matching.manual_block {
-        // Reject this malformed delimiter before the list parser's slice.
-        if entry.trim().trim_start_matches("@@") == "/" {
-            return Err(invalid(
-                "manual_block",
-                entry,
-                "empty regex delimiter".into(),
-            ));
-        }
         bl.parse_line(entry, ListFormat::AdBlock)
             .map_err(|e| invalid("manual_block", entry, e.to_string()))?;
     }
@@ -122,14 +114,14 @@ fn manual_rules(config: &Config) -> io::Result<Blocklist> {
 fn assemble(config: &Config, mut bl: Blocklist, bodies: &HashMap<String, String>) -> Blocklist {
     for url in &config.blocklists.urls {
         if let Some(body) = bodies.get(url) {
-            parse_lines_into(&mut bl, body);
+            parse_lines_into(&mut bl, body, url);
         } else {
             log::warn!("Blocklist {url} has no usable copy; skipping");
         }
     }
     for url in &config.blocklists.allowlist_urls {
         if let Some(body) = bodies.get(url) {
-            parse_lines_into_allow(&mut bl, body);
+            parse_lines_into_allow(&mut bl, body, url);
         } else {
             log::warn!("Allowlist {url} has no usable copy; skipping");
         }
@@ -140,7 +132,7 @@ fn assemble(config: &Config, mut bl: Blocklist, bodies: &HashMap<String, String>
     ] {
         for url in urls {
             if let Some(body) = bodies.get(url) {
-                parse_lines_into_regex(&mut bl, body, allow);
+                parse_lines_into_regex(&mut bl, body, allow, url);
             } else {
                 log::warn!("Regex list {url} has no usable copy; skipping");
             }

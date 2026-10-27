@@ -20,6 +20,10 @@ mod wire_forward_tests;
 #[path = "pool_tests.rs"]
 mod pool_tests;
 
+#[cfg(test)]
+#[path = "policy_tests.rs"]
+mod policy_tests;
+
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(2);
 /// EDNS0 UDP payload size we advertise to upstream. 1232 is the DNS flag day
 /// value: large enough to carry typical responses while staying under the common path MTU to avoid
@@ -306,6 +310,120 @@ pub struct QueryState {
     pub log_queries: bool,
 }
 
+#[derive(Clone, Copy)]
+enum ClientTransport {
+    Udp,
+    Tcp,
+}
+
+struct QueryResult {
+    wire: Vec<u8>,
+    question: DnsQuestion,
+    outcome: MatchOutcome,
+}
+
+/// Filtering and forwarding policy shared by both client transports.
+async fn process_query(
+    packet: &[u8],
+    state: &QueryState,
+    transport: ClientTransport,
+) -> io::Result<QueryResult> {
+    let (msg, opt_offset) = DnsMessage::parse_wire(packet)?;
+    if msg.header.flags & 0xf800 != 0 || msg.questions.len() != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Expected a standard single-question DNS query",
+        ));
+    }
+    let question = msg.questions[0].clone();
+    let outcome = state.blocklist.check(&question.name);
+    if matches!(outcome, MatchOutcome::Blocked(_)) {
+        log::info!("Blocking domain: {}", question.name);
+        return Ok(QueryResult {
+            wire: build_nxdomain(&msg)?,
+            question,
+            outcome,
+        });
+    }
+    let outgoing = query_with_edns(packet, opt_offset, EDNS_BUFFER_SIZE as u16)?;
+    let mut wire = match transport {
+        ClientTransport::Udp => {
+            let response = state.upstream.udp_query(&outgoing).await?;
+            if tc_bit_set(&response) {
+                state.upstream.tcp_query(&outgoing).await?
+            } else {
+                response
+            }
+        }
+        ClientTransport::Tcp => state.upstream.tcp_query(&outgoing).await?,
+    };
+    // An actual allow rule for the requested name exempts this entire query
+    // from filtering. It does not allow the target for any other query.
+    if !matches!(outcome, MatchOutcome::Allowed(_)) {
+        let response = DnsMessage::parse(&wire)?;
+        for target in response
+            .answers
+            .iter()
+            .filter_map(|rr| rr.cname_target.as_ref())
+        {
+            if let MatchOutcome::Blocked(rule) = state.blocklist.check(target) {
+                log::info!("Blocking CNAME target {target} for {}", question.name);
+                return Ok(QueryResult {
+                    wire: build_nxdomain(&msg)?,
+                    question,
+                    outcome: MatchOutcome::Blocked(format!("cname:{target} {rule}")),
+                });
+            }
+        }
+    }
+    if matches!(transport, ClientTransport::Udp) && wire.len() > client_udp_limit(&msg) {
+        wire = truncate_response(&wire, client_udp_limit(&msg))?;
+    }
+    Ok(QueryResult {
+        wire,
+        question,
+        outcome,
+    })
+}
+
+/// A single completion point prevents allowed/forwarded double counting.
+/// The sink is FnOnce: a completed request has at most one query-log entry.
+async fn handle_request<Send, Sent, Log>(
+    packet: &[u8],
+    state: &QueryState,
+    transport: ClientTransport,
+    client: SocketAddr,
+    send: Send,
+    log: Log,
+) -> io::Result<()>
+where
+    Send: FnOnce(Vec<u8>) -> Sent,
+    Sent: std::future::Future<Output = io::Result<()>>,
+    Log: FnOnce(&str, &str, &str, &str, &str),
+{
+    let QueryResult {
+        wire,
+        question,
+        outcome,
+    } = process_query(packet, state, transport).await?;
+    send(wire).await?;
+    if state.log_queries {
+        let (action, rule) = match &outcome {
+            MatchOutcome::Allowed(rule) => ("allowed", rule.as_str()),
+            MatchOutcome::Blocked(rule) => ("blocked", rule.as_str()),
+            MatchOutcome::Forwarded => ("forwarded", ""),
+        };
+        log(
+            &client.ip().to_string(),
+            &question.name,
+            qtype_str(question.qtype),
+            action,
+            rule,
+        );
+    }
+    Ok(())
+}
+
 pub type QueryStateHandle = Arc<RwLock<Arc<QueryState>>>;
 
 pub struct UdpForwarder {
@@ -399,118 +517,16 @@ impl UdpForwarder {
         client: std::net::SocketAddr,
         packet: Vec<u8>,
     ) -> io::Result<()> {
-        let (msg, opt_offset) = match DnsMessage::parse_wire(&packet[..]) {
-            Ok(m) => m,
-            Err(e) => {
-                log::error!("Failed to parse incoming UDP packet: {}", e);
-                return Err(e);
-            }
-        };
-
         let state = state_handle.read().await.clone();
-
-        if let Some(q) = msg.questions.first() {
-            let outcome = state.blocklist.check(&q.name);
-            match outcome {
-                MatchOutcome::Blocked(rule) => {
-                    log::info!("Blocking domain: {}", q.name);
-                    if state.log_queries {
-                        journald::log_query(
-                            &client.ip().to_string(),
-                            &q.name,
-                            qtype_str(q.qtype),
-                            "blocked",
-                            &rule,
-                        );
-                    }
-                    let response = build_nxdomain(&msg)?;
-                    socket.send_to(&response, client).await?;
-                    return Ok(());
-                }
-                MatchOutcome::Allowed(rule) => {
-                    if state.log_queries {
-                        journald::log_query(
-                            &client.ip().to_string(),
-                            &q.name,
-                            qtype_str(q.qtype),
-                            "allowed",
-                            &rule,
-                        );
-                    }
-                }
-                MatchOutcome::Forwarded => {}
-            }
-        }
-
-        let client_udp_size = client_udp_limit(&msg);
-        let packet_to_send = query_with_edns(&packet, opt_offset, EDNS_BUFFER_SIZE as u16)?;
-
-        let mut resp = state.upstream.udp_query(&packet_to_send).await?;
-
-        // Upstream truncated even within our advertised buffer: fall back to TCP
-        // to retrieve the full response.
-        if tc_bit_set(&resp) {
-            log::debug!("Upstream set TC; retrying over TCP");
-            resp = state.upstream.tcp_query(&packet_to_send).await?;
-        }
-
-        // CNAME cloaking check: parse the response and walk the answer section
-        // for CNAME records. If any target is blocked, return NXDOMAIN for the
-        // original question. The upstream path validates replies before they
-        // reach this filtering pass.
-        if let Some(q) = msg.questions.first() {
-            if let Ok(resp_msg) = DnsMessage::parse(&resp) {
-                for rr in &resp_msg.answers {
-                    if rr.rtype != 5 {
-                        continue;
-                    }
-                    let Some(target) = &rr.cname_target else {
-                        continue;
-                    };
-                    if let MatchOutcome::Blocked(rule) = state.blocklist.check(target) {
-                        log::info!("Blocking CNAME target {target} for {}", q.name);
-                        if state.log_queries {
-                            journald::log_query(
-                                &client.ip().to_string(),
-                                &q.name,
-                                qtype_str(q.qtype),
-                                "blocked",
-                                &format!("cname:{target} {rule}"),
-                            );
-                        }
-                        let nx = build_nxdomain(&msg)?;
-                        socket.send_to(&nx, client).await?;
-                        return Ok(());
-                    }
-                }
-            }
-        }
-
-        // The full response may still be too large for the client's UDP path.
-        // Signal truncation so the client retries over TCP.
-        if resp.len() > client_udp_size {
-            log::debug!(
-                "Response {}B exceeds client UDP limit {}B; setting TC",
-                resp.len(),
-                client_udp_size
-            );
-            resp = truncate_response(&resp, client_udp_size)?;
-        }
-
-        socket.send_to(&resp, client).await?;
-
-        if state.log_queries {
-            if let Some(q) = msg.questions.first() {
-                journald::log_query(
-                    &client.ip().to_string(),
-                    &q.name,
-                    qtype_str(q.qtype),
-                    "forwarded",
-                    "",
-                );
-            }
-        }
-        Ok(())
+        handle_request(
+            &packet,
+            &state,
+            ClientTransport::Udp,
+            client,
+            |wire| async move { socket.send_to(&wire, client).await.map(|_| ()) },
+            journald::log_query,
+        )
+        .await
     }
 
     async fn handle_tcp_query(
@@ -521,7 +537,7 @@ impl UdpForwarder {
         // RFC 7766: a client may send multiple queries on one TCP connection.
         // Loop until the client closes the connection (clean EOF), goes idle
         // (CLIENT_IDLE_TIMEOUT), or hits an error.
-        'next_query: loop {
+        loop {
             let mut len_buf = [0u8; 2];
             // Idle wait for the next query — long timeout, and a clean EOF or
             // expiry closes the connection normally (not an error).
@@ -539,93 +555,17 @@ impl UdpForwarder {
                 .await
                 .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Client read timeout"))??;
 
-            let (msg, opt_offset) = match DnsMessage::parse_wire(&packet[..]) {
-                Ok(m) => m,
-                Err(e) => return Err(e),
-            };
-
             let state = state_handle.read().await.clone();
-
-            if let Some(q) = msg.questions.first() {
-                let outcome = state.blocklist.check(&q.name);
-                match outcome {
-                    MatchOutcome::Blocked(rule) => {
-                        let response = build_nxdomain(&msg)?;
-                        write_tcp_message(client_stream, &response).await?;
-                        if state.log_queries {
-                            journald::log_query(
-                                &client_addr.ip().to_string(),
-                                &q.name,
-                                qtype_str(q.qtype),
-                                "blocked",
-                                &rule,
-                            );
-                        }
-                        continue 'next_query;
-                    }
-                    MatchOutcome::Allowed(rule) => {
-                        if state.log_queries {
-                            journald::log_query(
-                                &client_addr.ip().to_string(),
-                                &q.name,
-                                qtype_str(q.qtype),
-                                "allowed",
-                                &rule,
-                            );
-                        }
-                    }
-                    MatchOutcome::Forwarded => {}
-                }
-            }
-
-            let packet_to_send = query_with_edns(&packet, opt_offset, EDNS_BUFFER_SIZE as u16)?;
-
-            let resp = state.upstream.tcp_query(&packet_to_send).await?;
-
-            // CNAME cloaking check: same as the UDP path. If a CNAME target in
-            // the answer section is blocked, return NXDOMAIN for the original
-            // question. Reply validation has already happened upstream.
-            if let Some(q) = msg.questions.first() {
-                if let Ok(resp_msg) = DnsMessage::parse(&resp) {
-                    for rr in &resp_msg.answers {
-                        if rr.rtype != 5 {
-                            continue;
-                        }
-                        let Some(target) = &rr.cname_target else {
-                            continue;
-                        };
-                        if let MatchOutcome::Blocked(rule) = state.blocklist.check(target) {
-                            log::info!("Blocking CNAME target {target} for {}", q.name);
-                            if state.log_queries {
-                                journald::log_query(
-                                    &client_addr.ip().to_string(),
-                                    &q.name,
-                                    qtype_str(q.qtype),
-                                    "blocked",
-                                    &format!("cname:{target} {rule}"),
-                                );
-                            }
-                            let nx = build_nxdomain(&msg)?;
-                            write_tcp_message(client_stream, &nx).await?;
-                            continue 'next_query;
-                        }
-                    }
-                }
-            }
-
-            write_tcp_message(client_stream, &resp).await?;
-
-            if state.log_queries {
-                if let Some(q) = msg.questions.first() {
-                    journald::log_query(
-                        &client_addr.ip().to_string(),
-                        &q.name,
-                        qtype_str(q.qtype),
-                        "forwarded",
-                        "",
-                    );
-                }
-            }
+            let writer = &mut *client_stream;
+            handle_request(
+                &packet,
+                &state,
+                ClientTransport::Tcp,
+                client_addr,
+                |wire| async move { write_tcp_message(writer, &wire).await },
+                journald::log_query,
+            )
+            .await?;
         }
     }
 }

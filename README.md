@@ -66,7 +66,9 @@ Startup loads manual rules and all readable cached bodies, including stale ones,
 - Manual block/allow entries and regex rules from config
 - Regex block/allow lists fetched from URLs (one pattern per line, Pi-hole style)
 - Allow rules take precedence over block rules
-- Responses are also scanned for CNAME-cloaked trackers: a blocked CNAME target means NXDOMAIN
+- An allow-rule match on the requested name exempts that query from CNAME filtering, including exact, suffix and regex allow rules from config or lists. It does not allow the target for unrelated queries, and upstream NXDOMAIN/SERVFAIL still pass through.
+- Other responses are scanned for CNAME-cloaked trackers: a blocked CNAME target means NXDOMAIN
+- Hosts-file aliases are all parsed. Malformed rules are skipped safely; invalid remote regexes report their URL, line and skipped count (details limited to the first 10 per list).
 - Periodic background refresh with atomic swap
 
 **Fetching**
@@ -82,6 +84,7 @@ Startup loads manual rules and all readable cached bodies, including stale ones,
 **DNS**
 
 - UDP and TCP listeners (TCP with correct 2-byte length prefix)
+- Standard single-question DNS queries; ambiguous multi-question requests and non-query messages are rejected before filtering
 - Hand-written wire format parser and serializer
 - Name compression pointers with bounds checks and a jump limit
 - Names retain literal dots, backslashes and arbitrary label bytes using decimal escapes internally; only actual label boundaries become dots. Reserved label types and overlong names are rejected. Forwarded queries retain their original wire layout, so adding/updating OPT does not relocate compression pointers in opaque RDATA.
@@ -105,6 +108,7 @@ Startup loads manual rules and all readable cached bodies, including stale ones,
 
 - Optional per-query logging to journald with structured fields, enabled via `[logging] queries = true`
 - Each log entry carries: source IP, domain, query type, action (blocked/allowed/forwarded), and the matched rule
+- One filtering decision is logged per completed response. Failed delivery produces an operational error rather than a misleading success entry. Journal writes are nonblocking and best-effort; entries may be dropped if journald is unavailable or congested.
 - `dns-ligase stats` subcommand reads and filters the logs:
   ```
   dns-ligase stats                        # all recent queries
