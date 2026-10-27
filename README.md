@@ -88,7 +88,9 @@ Startup loads manual rules and all readable cached bodies, including stale ones,
 - EDNS0: advertises a 1232-byte buffer, sets the DO bit on outgoing queries even when the client didn't, passes RRSIG/NSEC and the AD flag through untouched
 - Truncation handling: if an upstream UDP response comes back with TC set, the query is retried over TCP. A response exceeding the client's UDP path is reduced to a TC reply with the question and OPT when they fit. Oversized OPT options are dropped. The client limit is its advertised size, with a 512-byte minimum and the IPv4 UDP payload ceiling; without OPT it is 512 bytes.
 - Upstream connection reuse: a bounded pool of connected UDP and TCP sockets to the upstream, shared across queries; timed-out or errored sockets are discarded rather than returned, so a late stray response can never leak into a later query; a dead pooled TCP connection is retried once on a fresh one
-- Timeouts on all upstream and client I/O; a dead listener exits loudly so systemd restarts the unit instead of serving half-protocol
+- Replies on both transports must match ID, response bit, opcode and all question names/types/classes. Stale replies are skipped within the deadline; sockets that see stale or malformed replies are discarded. UDP TC replies may have partial answer sections, but must carry the complete matching question before TCP fallback.
+- Each upstream exchange has one 2-second deadline covering checkout, connection, writes, reads, stale replies and the pooled TCP retry. Client TCP I/O is bounded separately, with a 30-second idle timeout. TCP frames send their prefix and body together with NODELAY enabled on both hops.
+- Both listeners bind before readiness. Transient TCP accept errors are logged with a 100 ms backoff so resource pressure cannot cause a busy loop.
 
 **Operations**
 

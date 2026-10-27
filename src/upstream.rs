@@ -1,25 +1,28 @@
 use std::collections::VecDeque;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{Mutex, RwLock};
-use tokio::time::{timeout, Duration};
+use tokio::time::{timeout, timeout_at, Duration, Instant};
 
 use crate::blocklist::{Blocklist, MatchOutcome};
-use crate::dns::{query_with_edns, DnsMessage};
+use crate::dns::{query_with_edns, DnsHeader, DnsMessage, DnsQuestion, MAX_DNS_MESSAGE};
 use crate::journald;
 
 #[cfg(test)]
 #[path = "wire_forward_tests.rs"]
 mod wire_forward_tests;
 
+#[cfg(test)]
+#[path = "pool_tests.rs"]
+mod pool_tests;
+
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(2);
-/// EDNS0 UDP payload size we advertise to upstream and the size of our
-/// upstream UDP recv buffer. 1232 is the DNS flag day value: large enough to
-/// carry typical responses while staying under the common path MTU to avoid
+/// EDNS0 UDP payload size we advertise to upstream. 1232 is the DNS flag day
+/// value: large enough to carry typical responses while staying under the common path MTU to avoid
 /// IP fragmentation. We advertise this fixed size regardless of what the client
 /// asked for; the client's own limit is honored separately via truncation.
 const EDNS_BUFFER_SIZE: usize = 1232;
@@ -32,11 +35,86 @@ const CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// created rather than blocking, so a burst never stalls.
 const UDP_POOL_CAP: usize = 16;
 const TCP_POOL_CAP: usize = 8;
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
 /// Monotonic counter for internally-generated query IDs (e.g. resolve_a).
 /// A counter is sufficient here — the IDs only need to be unique per
 /// in-flight query on our pooled sockets, not unpredictable.
 static INTERNAL_QUERY_ID: AtomicU16 = AtomicU16::new(1);
+
+#[derive(Debug)]
+struct QueryKey {
+    id: u16,
+    opcode: u16,
+    questions: Vec<DnsQuestion>,
+}
+
+impl QueryKey {
+    fn parse(query: &[u8]) -> io::Result<Self> {
+        if query.len() > MAX_DNS_MESSAGE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "DNS query too long",
+            ));
+        }
+        let mut reader = std::io::Cursor::new(query);
+        let header = DnsHeader::parse(&mut reader)?;
+        if header.flags & 0x8000 != 0 || header.qdcount == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Expected a DNS query with a question",
+            ));
+        }
+        let mut questions = Vec::new();
+        for _ in 0..header.qdcount {
+            questions.push(DnsQuestion::parse(&mut reader)?);
+        }
+        Ok(Self {
+            id: header.id,
+            opcode: header.flags & 0x7800,
+            questions,
+        })
+    }
+
+    fn matches_questions(&self, questions: &[DnsQuestion]) -> bool {
+        self.questions.len() == questions.len()
+            && self.questions.iter().zip(questions).all(|(query, reply)| {
+                query.qtype == reply.qtype
+                    && query.qclass == reply.qclass
+                    && query.name.eq_ignore_ascii_case(&reply.name)
+            })
+    }
+
+    /// A UDP TC reply may stop inside an answer. Its header and complete
+    /// question must still match before it can trigger a TCP retry.
+    fn matches_response(&self, wire: &[u8], allow_partial_tc: bool) -> io::Result<bool> {
+        let mut reader = std::io::Cursor::new(wire);
+        let header = DnsHeader::parse(&mut reader)?;
+        if header.id != self.id
+            || header.flags & 0x8000 == 0
+            || header.flags & 0x7800 != self.opcode
+        {
+            return Ok(false);
+        }
+        if allow_partial_tc && header.flags & 0x0200 != 0 {
+            let mut questions = Vec::new();
+            for _ in 0..header.qdcount {
+                questions.push(DnsQuestion::parse(&mut reader)?);
+            }
+            return Ok(self.matches_questions(&questions));
+        }
+        // Fully validate ordinary replies before reusing a socket. Opaque
+        // record data remains in its original packet for downstream delivery.
+        Ok(self.matches_questions(&DnsMessage::parse(wire)?.questions))
+    }
+}
+
+fn upstream_timeout(transport: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!("Upstream {transport} deadline exceeded"),
+    )
+}
 
 /// A pool of connected sockets to a single upstream resolver.
 ///
@@ -84,110 +162,112 @@ impl Upstream {
             resp_bytes = self.tcp_query(&wire).await?;
         }
         if tc_bit_set(&resp_bytes) {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "Truncated bootstrap DNS response"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Truncated bootstrap DNS response",
+            ));
         }
         let resp = DnsMessage::parse(&resp_bytes)?;
         Ok(resp.a_records())
     }
 
-    /// Forward a query over UDP and return the full response.
-    /// On timeout or I/O error the socket is discarded (never returned).
+    /// One overall deadline covers checkout, send, stale replies and return.
+    /// Any failed or contaminated socket is discarded.
     pub async fn udp_query(&self, query: &[u8]) -> io::Result<Vec<u8>> {
-        let socket = match self.udp_pool.lock().await.pop_back() {
-            Some(s) => s,
+        let key = QueryKey::parse(query)?;
+        let deadline = Instant::now() + UPSTREAM_TIMEOUT;
+        timeout_at(deadline, self.udp_exchange(query, &key, deadline))
+            .await
+            .map_err(|_| upstream_timeout("UDP"))?
+    }
+
+    async fn udp_exchange(
+        &self,
+        query: &[u8],
+        key: &QueryKey,
+        deadline: Instant,
+    ) -> io::Result<Vec<u8>> {
+        // Drop the pool guard before binding or connecting a fresh socket.
+        let pooled = self.udp_pool.lock().await.pop_back();
+        let socket = match pooled {
+            Some(socket) => socket,
             None => {
-                let s = UdpSocket::bind("0.0.0.0:0").await?;
-                s.connect(self.addr).await?;
-                s
+                let socket = UdpSocket::bind("0.0.0.0:0").await?;
+                socket.connect(self.addr).await?;
+                socket
             }
         };
         socket.send(query).await?;
-
-        // The query ID is the first 2 bytes. Validate the response ID matches
-        // before accepting — a stale datagram from a previous query on a pooled
-        // socket would otherwise be returned as the answer to this query.
-        let query_id = if query.len() >= 2 {
-            u16::from_be_bytes([query[0], query[1]])
-        } else {
-            0
-        };
-
-        let mut buf = vec![0u8; EDNS_BUFFER_SIZE];
-        let len = match timeout(UPSTREAM_TIMEOUT, socket.recv(&mut buf)).await {
-            Ok(Ok(len)) => len,
-            Ok(Err(e)) => return Err(e),
-            Err(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "Upstream UDP timeout",
-                ))
+        // One sentinel byte detects oversized datagrams without allocating a
+        // 64 KiB buffer on every query or silently relaying a clipped packet.
+        let mut buf = vec![0; EDNS_BUFFER_SIZE + 1];
+        let mut reusable = true;
+        loop {
+            if Instant::now() >= deadline {
+                return Err(upstream_timeout("UDP"));
             }
-        };
-
-        // ID mismatch: a stale datagram was queued on this socket. Discard the
-        // socket (don't pool it) and return an error so the client retries.
-        let resp_id = if len >= 2 {
-            u16::from_be_bytes([buf[0], buf[1]])
-        } else {
-            0
-        };
-        if resp_id != query_id {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Upstream UDP response ID mismatch — stale datagram discarded",
-            ));
+            let len = socket.recv(&mut buf).await?;
+            if len > EDNS_BUFFER_SIZE {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Upstream UDP reply exceeds advertised buffer",
+                ));
+            }
+            if !key.matches_response(&buf[..len], true)? {
+                reusable = false;
+                log::debug!("Discarding stale upstream UDP reply");
+                continue;
+            }
+            if reusable {
+                let mut pool = self.udp_pool.lock().await;
+                if pool.len() < UDP_POOL_CAP {
+                    pool.push_back(socket);
+                }
+            }
+            buf.truncate(len);
+            return Ok(buf);
         }
-
-        // Success: return the socket if there is room, else let it drop.
-        let mut pool = self.udp_pool.lock().await;
-        if pool.len() < UDP_POOL_CAP {
-            pool.push_back(socket);
-        }
-        buf.truncate(len);
-        Ok(buf)
     }
 
-    /// Forward a query over TCP and return the full response.
-    /// On timeout or I/O error the connection is discarded (never returned).
-    /// A pooled connection that died while idle is retried once on a fresh
-    /// connection instead of failing the query.
+    /// Match complete replies and retry a dead pooled connection once. Both
+    /// attempts share a single deadline, rather than extending it per I/O.
     pub async fn tcp_query(&self, query: &[u8]) -> io::Result<Vec<u8>> {
-        // NOTE: the pop is a separate statement on purpose. A
-        // `if let Some(..) = self.tcp_pool.lock().await.pop_back()` scrutinee
-        // would keep the MutexGuard alive for the whole if-let body and
-        // deadlock in return_tcp() below (tokio Mutexes are not reentrant).
+        let key = QueryKey::parse(query)?;
+        let deadline = Instant::now() + UPSTREAM_TIMEOUT;
+        timeout_at(deadline, self.tcp_exchange(query, &key, deadline))
+            .await
+            .map_err(|_| upstream_timeout("TCP"))?
+    }
+
+    async fn tcp_exchange(
+        &self,
+        query: &[u8],
+        key: &QueryKey,
+        deadline: Instant,
+    ) -> io::Result<Vec<u8>> {
         let pooled = self.tcp_pool.lock().await.pop_back();
-        if let Some(pooled) = pooled {
-            match Self::tcp_query_on(pooled, query).await {
-                Ok((stream, bytes)) => {
-                    self.return_tcp(stream).await;
+        if let Some(stream) = pooled {
+            match Self::tcp_query_on(stream, query, key, deadline).await {
+                Ok((stream, bytes, reusable)) => {
+                    if reusable {
+                        self.return_tcp(stream).await;
+                    }
                     return Ok(bytes);
                 }
-                Err(e) => {
-                    log::debug!(
-                        "Pooled upstream TCP connection failed ({e}); retrying on a fresh one"
-                    );
-                }
+                Err(e) => log::debug!(
+                    "Pooled upstream TCP connection failed ({e}); retrying on a fresh one"
+                ),
             }
         }
-        let stream = timeout(UPSTREAM_TIMEOUT, TcpStream::connect(self.addr))
-            .await
-            .map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "Upstream TCP connect timeout",
-                )
-            })??;
-        match Self::tcp_query_on(stream, query).await {
-            Ok((stream, bytes)) => {
-                self.return_tcp(stream).await;
-                Ok(bytes)
-            }
-            Err(e) => Err(e),
+        let stream = TcpStream::connect(self.addr).await?;
+        stream.set_nodelay(true)?;
+        let (stream, bytes, reusable) = Self::tcp_query_on(stream, query, key, deadline).await?;
+        if reusable {
+            self.return_tcp(stream).await;
         }
+        Ok(bytes)
     }
 
-    /// Return a healthy stream to the pool if there is room, else let it drop.
     async fn return_tcp(&self, stream: TcpStream) {
         let mut pool = self.tcp_pool.lock().await;
         if pool.len() < TCP_POOL_CAP {
@@ -195,31 +275,27 @@ impl Upstream {
         }
     }
 
-    /// Drive a single query over an owned TCP stream, returning the stream
-    /// (so the caller can pool it) and the response bytes.
     async fn tcp_query_on(
         mut stream: TcpStream,
         query: &[u8],
-    ) -> io::Result<(TcpStream, Vec<u8>)> {
-        let len_buf = (query.len() as u16).to_be_bytes();
-        timeout(UPSTREAM_TIMEOUT, stream.write_all(&len_buf))
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Upstream TCP write timeout"))??;
-        timeout(UPSTREAM_TIMEOUT, stream.write_all(query))
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Upstream TCP write timeout"))??;
-        stream.flush().await?;
-
-        let mut resp_len_buf = [0u8; 2];
-        timeout(UPSTREAM_TIMEOUT, stream.read_exact(&mut resp_len_buf))
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Upstream TCP read timeout"))??;
-        let resp_len = u16::from_be_bytes(resp_len_buf) as usize;
-        let mut resp = vec![0u8; resp_len];
-        timeout(UPSTREAM_TIMEOUT, stream.read_exact(&mut resp))
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Upstream TCP read timeout"))??;
-        Ok((stream, resp))
+        key: &QueryKey,
+        deadline: Instant,
+    ) -> io::Result<(TcpStream, Vec<u8>, bool)> {
+        write_tcp_frame(&mut stream, query, deadline).await?;
+        let mut reusable = true;
+        loop {
+            if Instant::now() >= deadline {
+                return Err(upstream_timeout("TCP"));
+            }
+            let len = stream.read_u16().await? as usize;
+            let mut reply = vec![0; len];
+            stream.read_exact(&mut reply).await?;
+            if key.matches_response(&reply, false)? {
+                return Ok((stream, reply, reusable));
+            }
+            reusable = false;
+            log::debug!("Discarding stale upstream TCP reply");
+        }
     }
 }
 
@@ -267,13 +343,8 @@ impl UdpForwarder {
                         let state_ref = Arc::clone(&state_udp);
                         let socket_ref = Arc::clone(&udp_socket);
                         tokio::spawn(async move {
-                            if let Err(e) = Self::handle_udp_query(
-                                socket_ref,
-                                state_ref,
-                                addr,
-                                packet,
-                            )
-                            .await
+                            if let Err(e) =
+                                Self::handle_udp_query(socket_ref, state_ref, addr, packet).await
                             {
                                 log::error!("UDP query error: {}", e);
                             }
@@ -294,17 +365,24 @@ impl UdpForwarder {
         let state_tcp = Arc::clone(&self.state);
         tasks.push(tokio::spawn(async move {
             loop {
-                if let Ok((mut stream, addr)) = listener.accept().await {
-                    let state_ref = Arc::clone(&state_tcp);
-                    tokio::spawn(async move {
-                        if let Err(e) =
-                            Self::handle_tcp_query(&mut stream, state_ref, addr)
-                                .await
-                        {
-                            log::error!("TCP query error: {}", e);
-                        }
-                    });
+                let (mut stream, addr) = match listener.accept().await {
+                    Ok(client) => client,
+                    Err(e) => {
+                        log::error!("TCP accept error: {e}");
+                        tokio::time::sleep(ACCEPT_BACKOFF).await;
+                        continue;
+                    }
+                };
+                if let Err(e) = stream.set_nodelay(true) {
+                    log::warn!("Could not configure TCP client {addr}: {e}");
+                    continue;
                 }
+                let state_ref = Arc::clone(&state_tcp);
+                tokio::spawn(async move {
+                    if let Err(e) = Self::handle_tcp_query(&mut stream, state_ref, addr).await {
+                        log::error!("TCP query error: {e}");
+                    }
+                });
             }
         }));
 
@@ -378,15 +456,17 @@ impl UdpForwarder {
 
         // CNAME cloaking check: parse the response and walk the answer section
         // for CNAME records. If any target is blocked, return NXDOMAIN for the
-        // original question. A malformed response is relayed as-is (parse
-        // failure does not break forwarding).
+        // original question. The upstream path validates replies before they
+        // reach this filtering pass.
         if let Some(q) = msg.questions.first() {
             if let Ok(resp_msg) = DnsMessage::parse(&resp) {
                 for rr in &resp_msg.answers {
                     if rr.rtype != 5 {
                         continue;
                     }
-                    let Some(target) = &rr.cname_target else { continue };
+                    let Some(target) = &rr.cname_target else {
+                        continue;
+                    };
                     if let MatchOutcome::Blocked(rule) = state.blocklist.check(target) {
                         log::info!("Blocking CNAME target {target} for {}", q.name);
                         if state.log_queries {
@@ -504,14 +584,16 @@ impl UdpForwarder {
 
             // CNAME cloaking check: same as the UDP path. If a CNAME target in
             // the answer section is blocked, return NXDOMAIN for the original
-            // question. A malformed response is relayed as-is.
+            // question. Reply validation has already happened upstream.
             if let Some(q) = msg.questions.first() {
                 if let Ok(resp_msg) = DnsMessage::parse(&resp) {
                     for rr in &resp_msg.answers {
                         if rr.rtype != 5 {
                             continue;
                         }
-                        let Some(target) = &rr.cname_target else { continue };
+                        let Some(target) = &rr.cname_target else {
+                            continue;
+                        };
                         if let MatchOutcome::Blocked(rule) = state.blocklist.check(target) {
                             log::info!("Blocking CNAME target {target} for {}", q.name);
                             if state.log_queries {
@@ -589,17 +671,20 @@ fn build_nxdomain(msg: &DnsMessage) -> io::Result<Vec<u8>> {
 /// Write a DNS message to a TCP stream with the 2-byte length prefix.
 /// Bounded by a timeout so a stalled client can't park its handler task forever.
 async fn write_tcp_message(stream: &mut TcpStream, msg: &[u8]) -> io::Result<()> {
-    let len_buf = (msg.len() as u16).to_be_bytes();
-    timeout(UPSTREAM_TIMEOUT, stream.write_all(&len_buf))
+    write_tcp_frame(stream, msg, Instant::now() + UPSTREAM_TIMEOUT).await
+}
+
+/// Pass the prefix and body to TCP together. NODELAY on both hops also avoids
+/// delayed-ACK stalls when a peer splits its own reads or writes.
+async fn write_tcp_frame(stream: &mut TcpStream, msg: &[u8], deadline: Instant) -> io::Result<()> {
+    let len = u16::try_from(msg.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "DNS TCP message too long"))?;
+    let mut frame = Vec::with_capacity(msg.len() + 2);
+    frame.extend_from_slice(&len.to_be_bytes());
+    frame.extend_from_slice(msg);
+    timeout_at(deadline, stream.write_all(&frame))
         .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Client TCP write timeout"))??;
-    timeout(UPSTREAM_TIMEOUT, stream.write_all(msg))
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Client TCP write timeout"))??;
-    timeout(UPSTREAM_TIMEOUT, stream.flush())
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Client TCP write timeout"))??;
-    Ok(())
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "DNS TCP write deadline exceeded"))?
 }
 
 /// True if the TC (truncation) bit is set in a DNS message's flags.
@@ -615,8 +700,12 @@ fn tc_bit_set(msg: &[u8]) -> bool {
 /// are limited only by the IPv4 UDP payload ceiling, rather than reverting to
 /// the legacy limit and causing unnecessary TCP retries.
 fn client_udp_limit(msg: &DnsMessage) -> usize {
-    msg.additionals.iter().find(|rr| rr.rtype == 41)
-        .map(|opt| usize::from(opt.rclass)).unwrap_or(512).clamp(512, MAX_UDP_PAYLOAD)
+    msg.additionals
+        .iter()
+        .find(|rr| rr.rtype == 41)
+        .map(|opt| usize::from(opt.rclass))
+        .unwrap_or(512)
+        .clamp(512, MAX_UDP_PAYLOAD)
 }
 
 /// Keep the question and OPT when they fit, setting TC so the client retries
@@ -634,7 +723,9 @@ fn truncate_response(resp: &[u8], limit: usize) -> io::Result<Vec<u8>> {
     if wire.len() > limit {
         // Large OPT options (e.g. padding) must not make the TC reply exceed
         // the client's path. Preserve its extended RCODE and flags.
-        for opt in &mut msg.additionals { opt.rdata.clear(); }
+        for opt in &mut msg.additionals {
+            opt.rdata.clear();
+        }
         wire = msg.serialize()?;
     }
     if wire.len() > limit {
@@ -642,11 +733,13 @@ fn truncate_response(resp: &[u8], limit: usize) -> io::Result<Vec<u8>> {
         wire = msg.serialize()?;
     }
     if wire.len() > limit {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "UDP limit too small for DNS header"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "UDP limit too small for DNS header",
+        ));
     }
     Ok(wire)
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

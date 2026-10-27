@@ -25,6 +25,7 @@ struct App {
     interval: u64,
     cache_path: PathBuf,
     child: Option<Child>,
+    limit_descriptors: bool,
 }
 impl App {
     fn new(upstream_port: u16) -> Self {
@@ -48,6 +49,7 @@ impl App {
             blocked: vec![],
             interval: 3600,
             child: None,
+            limit_descriptors: false,
         }
     }
     fn write_config(&self) {
@@ -86,8 +88,17 @@ queries=false
     fn start(&mut self) {
         self.write_config();
         let log = fs::File::create(self.dir.join("log")).unwrap();
-        self.child = Some(
+        let mut command = if self.limit_descriptors {
+            // Limit only this child; leave the test runner and host untouched.
+            let mut command = Command::new("bash");
+            command.args(["-c", "ulimit -n 32; exec \"$@\"", "dns-ligase-test"]);
+            command.arg(env!("CARGO_BIN_EXE_dns-ligase"));
+            command
+        } else {
             Command::new(env!("CARGO_BIN_EXE_dns-ligase"))
+        };
+        self.child = Some(
+            command
                 .arg("--config")
                 .arg(self.dir.join("config.toml"))
                 .env("RUST_LOG", "info")
@@ -487,7 +498,10 @@ async fn invalid_reload_retains_working_rules() {
     assert_eq!(rcode(&app.udp("old.manual").await.unwrap()), 3);
     for (interval, marker) in [
         (0, "refresh_interval_secs must be greater than zero"),
-        (i64::MAX as u64, "refresh_interval_secs exceeds the timer range"),
+        (
+            i64::MAX as u64,
+            "refresh_interval_secs exceeds the timer range",
+        ),
     ] {
         app.interval = interval;
         app.write_config();
@@ -597,4 +611,39 @@ async fn existing_body_is_usable_at_boot_with_corrupt_metadata() {
     list.wait_count(1).await;
     assert_eq!(rcode(&app.udp("cached.test").await.unwrap()), 3);
     app.stop().await;
+}
+
+#[tokio::test]
+async fn descriptor_exhaustion_backs_off_and_recovers_without_stalling_udp() {
+    let upstream = dns(false).await;
+    let mut app = App::new(upstream.port);
+    app.limit_descriptors = true;
+    app.blocked.push("manual.test".into());
+    app.start();
+    app.wait_log("Initial remote refresh completed.").await;
+    let mut connections = Vec::new();
+    for _ in 0..48 {
+        connections.push(timeout_connect(app.port).await);
+    }
+    app.wait_log("TCP accept error:").await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let errors = app.log().matches("TCP accept error:").count();
+    assert!(
+        (1..=20).contains(&errors),
+        "unbounded accept-error loop: {errors}"
+    );
+    assert_eq!(rcode(&app.udp("manual.test").await.unwrap()), 3);
+    drop(connections);
+    assert_eq!(rcode(&app.tcp("manual.test").await), 3);
+    app.stop().await;
+}
+
+async fn timeout_connect(port: u16) -> TcpStream {
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        TcpStream::connect(("127.0.0.1", port)),
+    )
+    .await
+    .unwrap()
+    .unwrap()
 }
