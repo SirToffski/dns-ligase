@@ -1,10 +1,11 @@
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
+use std::time::{Duration, SystemTime};
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -137,8 +138,9 @@ impl Blocklist {
     }
 
     #[allow(dead_code)]
-    pub async fn fetch_and_parse(&mut self, url: &str, format: Option<ListFormat>) -> Result<(), Box<dyn Error>> {
-        let content = reqwest::get(url).await?.text().await?;
+    pub async fn fetch_and_parse(&mut self, url: &str, format: Option<ListFormat>, upstream: Arc<Upstream>) -> Result<(), Box<dyn Error>> {
+        let content = list_client_builder(upstream).build()?
+            .get(url).send().await?.error_for_status()?.text().await?;
         for line in content.lines() {
             match format {
                 Some(f) => self.parse_line(line, f)?,
@@ -395,72 +397,43 @@ fn bodies_dir(cache_path: &str) -> PathBuf {
         .join("cache.d")
 }
 
-/// Build an HTTP client for fetching `url_str`, pinning the URL's hostname to
-/// addresses resolved through our own upstream.
-///
-/// TLS still uses the hostname for SNI and certificate validation — only the
-/// address lookup is overridden. On any resolution failure (parse error, IP
-/// literal, upstream unreachable, no A records) returns a plain client so the
-/// system resolver gets a chance as a backstop.
-async fn client_for_url(url_str: &str, upstream: &Upstream) -> reqwest::Client {
-    let parsed = match url::Url::parse(url_str) {
-        Ok(u) => u,
-        Err(e) => {
-            log::warn!("Could not parse list URL {url_str} ({e}); using system resolver");
-            return reqwest::Client::new();
-        }
-    };
-    let host = match parsed.host_str() {
-        Some(h) => h.to_string(),
-        None => {
-            log::warn!("List URL {url_str} has no hostname; using system resolver");
-            return reqwest::Client::new();
-        }
-    };
-    // IP literals need no resolution.
-    if host.parse::<IpAddr>().is_ok() {
-        return reqwest::Client::new();
-    }
-    let ips = match upstream.resolve_a(&host).await {
-        Ok(ips) if !ips.is_empty() => ips,
-        Ok(_) => {
-            log::warn!("Upstream returned no A records for {host}; using system resolver");
-            return reqwest::Client::new();
-        }
-        Err(e) => {
-            log::warn!("Upstream resolution failed for {host} ({e}); using system resolver");
-            return reqwest::Client::new();
-        }
-    };
-    // The port in the override addr is ignored by reqwest (it uses the URL's
-    // own port / scheme default); pass the URL's effective port anyway.
-    let port = parsed.port_or_known_default().unwrap_or(443);
-    let addrs: Vec<SocketAddr> = ips
-        .into_iter()
-        .map(|ip| SocketAddr::new(IpAddr::V4(ip), port))
-        .collect();
-    reqwest::Client::builder()
-        .resolve_to_addrs(&host, &addrs)
-        .build()
-        .unwrap_or_else(|e| {
-            log::warn!("Failed to build resolving client for {host} ({e}); using system resolver");
-            reqwest::Client::new()
+const LIST_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const LIST_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Resolves every hostname, including redirect destinations, through unbound.
+/// Never fall back to system DNS: it may point back at this process.
+struct ListResolver(Arc<Upstream>);
+
+impl reqwest::dns::Resolve for ListResolver {
+    fn resolve(&self, name: hyper::client::connect::dns::Name) -> reqwest::dns::Resolving {
+        let upstream = Arc::clone(&self.0);
+        Box::pin(async move {
+            let ips = upstream.resolve_a(name.as_str()).await?;
+            if ips.is_empty() {
+                return Err(io::Error::new(io::ErrorKind::NotFound,
+                    format!("No upstream A records for {name}")).into());
+            }
+            // reqwest substitutes the URL's port for zero.
+            let addrs: reqwest::dns::Addrs = Box::new(ips.into_iter()
+                .map(|ip| SocketAddr::new(IpAddr::V4(ip), 0)));
+            Ok(addrs)
         })
+    }
+}
+
+fn list_client_builder(upstream: Arc<Upstream>) -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .dns_resolver(Arc::new(ListResolver(upstream)))
+        // Proxy-side DNS would bypass the configured resolver.
+        .no_proxy()
+        .connect_timeout(LIST_CONNECT_TIMEOUT)
+        .timeout(LIST_REQUEST_TIMEOUT)
 }
 
 /// Read a cached body file from disk. Free function so the download phase can
 /// use it without holding the cache lock.
 fn read_body_file(cache_path: &str, filename: &str) -> Option<String> {
     fs::read_to_string(bodies_dir(cache_path).join(filename)).ok()
-}
-
-/// Grouping key for sharing HTTP clients: lowercase hostname, or the full URL
-/// when it has none (unparseable URLs each get their own fallback client).
-fn client_key(url_str: &str) -> String {
-    url::Url::parse(url_str)
-        .ok()
-        .and_then(|u| u.host_str().map(|h| h.to_lowercase()))
-        .unwrap_or_else(|| url_str.to_string())
 }
 
 /// One URL needing a download, with its stored etag for a conditional GET.
@@ -471,6 +444,7 @@ pub struct FetchJob {
 
 /// Outcome of downloading one URL. Carries everything phase 3 needs without
 /// further I/O.
+#[derive(Debug)]
 pub enum DownloadResult {
     /// New content: persist the body file and metadata.
     Fresh { body: String, etag: Option<String> },
@@ -479,7 +453,7 @@ pub enum DownloadResult {
     NotModified,
     /// Failure but a stale body file was present: serve it WITHOUT refreshing
     /// `fetched_at`, so a dead list is retried (not silenced for a full TTL).
-    StaleFallback(String),
+    StaleFallback { body: String, error: String },
     /// No body available (error message for the warning log).
     Failed(String),
 }
@@ -501,51 +475,71 @@ async fn download_one(
     client: &reqwest::Client,
     cache_path: &str,
 ) -> DownloadResult {
+    // The deadline includes a possible second GET after a missing-body 304.
+    match tokio::time::timeout(LIST_REQUEST_TIMEOUT, download_response(url, etag, client, cache_path)).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => stale_or_failed(url, cache_path, error),
+        Err(_) => stale_or_failed(url, cache_path, "List download deadline exceeded".into()),
+    }
+}
+
+fn stale_or_failed(url: &str, cache_path: &str, error: String) -> DownloadResult {
+    match read_body_file(cache_path, &url_to_filename(url)) {
+        Some(body) => DownloadResult::StaleFallback { body, error },
+        None => DownloadResult::Failed(error),
+    }
+}
+
+async fn download_response(
+    url: &str, etag: Option<&str>, client: &reqwest::Client, cache_path: &str,
+) -> Result<DownloadResult, String> {
     let mut request = client.get(url);
     if let Some(etag) = etag {
         request = request.header(reqwest::header::IF_NONE_MATCH, etag);
     }
-    let filename = url_to_filename(url);
-    let read_cached = || read_body_file(cache_path, &filename);
+    let mut resp = request.send().await.map_err(|e| format!("request failed: {e}"))?;
+    if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
+        if read_body_file(cache_path, &url_to_filename(url)).is_some() {
+            return Ok(DownloadResult::NotModified);
+        }
+        log::warn!("304 for {url} but body file missing; refetching");
+        resp = client.get(url).send().await.map_err(|e| format!("refetch failed: {e}"))?;
+    }
+    if resp.status() != reqwest::StatusCode::OK {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+    let etag = resp_etag(&resp);
+    let body = resp.text().await.map_err(|e| format!("read body: {e}"))?;
+    Ok(DownloadResult::Fresh { body, etag })
+}
 
-    let resp = match request.send().await {
-        Ok(r) => r,
-        Err(e) => {
-            return read_cached()
-                .map(DownloadResult::StaleFallback)
-                .unwrap_or_else(|| DownloadResult::Failed(format!("request failed: {e}")));
+static TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
+
+/// Replace a cache file only after its complete contents reach disk.
+fn atomic_write(path: &Path, data: &[u8]) -> io::Result<()> {
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    fs::create_dir_all(parent)?;
+    let filename = path.file_name().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Missing cache filename"))?;
+    let (temp_path, mut file) = loop {
+        let id = TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed);
+        let name = format!(".{}.{}.{id}.tmp", filename.to_string_lossy(), std::process::id());
+        let temp_path = parent.join(name);
+        match fs::OpenOptions::new().write(true).create_new(true).open(&temp_path) {
+            Ok(file) => break (temp_path, file),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
         }
     };
-    match resp.status() {
-        reqwest::StatusCode::NOT_MODIFIED => {
-            if read_cached().is_some() {
-                DownloadResult::NotModified
-            } else {
-                // Body file missing despite a 304 — do a full unconditional GET.
-                log::warn!("304 for {url} but body file missing; refetching");
-                match client.get(url).send().await {
-                    Ok(r) => {
-                        let new_etag = resp_etag(&r);
-                        match r.text().await {
-                            Ok(body) => DownloadResult::Fresh { body, etag: new_etag },
-                            Err(e) => DownloadResult::Failed(format!("read body: {e}")),
-                        }
-                    }
-                    Err(e) => DownloadResult::Failed(format!("refetch failed: {e}")),
-                }
-            }
-        }
-        reqwest::StatusCode::OK => {
-            let new_etag = resp_etag(&resp);
-            match resp.text().await {
-                Ok(body) => DownloadResult::Fresh { body, etag: new_etag },
-                Err(e) => DownloadResult::Failed(format!("read body: {e}")),
-            }
-        }
-        status => read_cached()
-            .map(DownloadResult::StaleFallback)
-            .unwrap_or_else(|| DownloadResult::Failed(format!("HTTP {status}"))),
+    let result = (|| {
+        file.write_all(data)?;
+        file.sync_all()?;
+        fs::rename(&temp_path, path)?;
+        fs::File::open(parent)?.sync_all()
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temp_path);
     }
+    result
 }
 
 impl CachedLists {
@@ -563,10 +557,7 @@ impl CachedLists {
     /// Write a body to disk. Creates the bodies directory if needed.
     fn write_body(&self, cache_path: &str, filename: &str, body: &str) -> io::Result<()> {
         let dir = bodies_dir(cache_path);
-        fs::create_dir_all(&dir)?;
-        let path = dir.join(filename);
-        fs::write(path, body)?;
-        Ok(())
+        atomic_write(&dir.join(filename), body.as_bytes())
     }
 
     /// Get cached body if it was fetched within the interval and the body
@@ -609,34 +600,25 @@ impl CachedLists {
         (fresh, jobs)
     }
 
-    /// Phase 2 (async — call WITHOUT holding the cache lock): download all
-    /// jobs concurrently via a JoinSet. One HTTP client is built per distinct
-    /// hostname (the resolve override is per-client per-host, so same-host
-    /// URLs share a client while different hosts stay pinned correctly) —
-    /// which also means one upstream resolve per host instead of per URL.
+    /// Phase 2: download concurrently with one pooled client. Every connection
+    /// resolves through unbound, including redirects to other hostnames.
     pub async fn download_jobs(
         jobs: Vec<FetchJob>,
         cache_path: &str,
-        upstream: &Upstream,
+        upstream: Arc<Upstream>,
     ) -> Vec<(String, DownloadResult)> {
-        // Group job indices by hostname so same-host URLs share a client.
-        let mut by_host: HashMap<String, Vec<usize>> = HashMap::new();
-        for (i, job) in jobs.iter().enumerate() {
-            by_host.entry(client_key(&job.url)).or_default().push(i);
-        }
-        let mut clients: HashMap<String, reqwest::Client> = HashMap::new();
-        for (host, idxs) in &by_host {
-            let url = &jobs[idxs[0]].url;
-            clients.insert(host.clone(), client_for_url(url, upstream).await);
-        }
-
+        if jobs.is_empty() { return Vec::new(); }
+        let client = match list_client_builder(upstream).build() {
+            Ok(client) => client,
+            Err(e) => return jobs.into_iter().map(|job| {
+                let result = stale_or_failed(&job.url, cache_path, format!("HTTP client: {e}"));
+                (job.url, result)
+            }).collect(),
+        };
         let cache_path = cache_path.to_string();
         let mut set = tokio::task::JoinSet::new();
         for job in jobs {
-            let client = clients
-                .get(&client_key(&job.url))
-                .cloned()
-                .unwrap_or_else(reqwest::Client::new);
+            let client = client.clone();
             let cp = cache_path.clone();
             set.spawn(async move {
                 let FetchJob { url, etag } = job;
@@ -673,6 +655,9 @@ impl CachedLists {
                     let filename = url_to_filename(&url);
                     if let Err(e) = self.write_body(cache_path, &filename, &body) {
                         log::error!("Failed to write cached body for {url}: {e}");
+                        // Serve the valid download now; keep the metadata/ETag
+                        // paired with the old disk body for the next retry.
+                        bodies.push((url, body));
                         continue;
                     }
                     self.map.insert(url.clone(), CachedList {
@@ -705,7 +690,10 @@ impl CachedLists {
                         }
                     }
                 }
-                DownloadResult::StaleFallback(body) => bodies.push((url, body)),
+                DownloadResult::StaleFallback { body, error } => {
+                    log::warn!("Fetch failed for {url}; using cached copy: {error}");
+                    bodies.push((url, body));
+                }
                 DownloadResult::Failed(err) => {
                     log::warn!("Fetch failed for {url}, no cached copy: {err}");
                 }
@@ -739,12 +727,9 @@ impl CachedLists {
         if !self.dirty {
             return Ok(());
         }
-        self.dirty = false;
-        if let Some(parent) = Path::new(path).parent() {
-            fs::create_dir_all(parent)?;
-        }
         let data = serde_json::to_string(self)?;
-        fs::write(path, data)?;
+        atomic_write(Path::new(path), data.as_bytes())?;
+        self.dirty = false;
         Ok(())
     }
 
@@ -1036,22 +1021,6 @@ mod tests {
     }
 
     #[test]
-    fn test_client_key_groups_by_host() {
-        assert_eq!(
-            client_key("https://example.com/a.txt"),
-            client_key("https://example.com/other/path.txt")
-        );
-        assert_eq!(client_key("https://example.com/a.txt"), "example.com");
-        assert_eq!(client_key("https://EXAMPLE.com/a.txt"), "example.com");
-        assert_ne!(
-            client_key("https://a.example.com/l.txt"),
-            client_key("https://b.example.com/l.txt")
-        );
-        // Unparseable URLs key on themselves (own fallback client each).
-        assert_eq!(client_key("not a url %%"), "not a url %%");
-    }
-
-    #[test]
     fn test_plan_and_merge_round_trip() {
         let dir = std::env::temp_dir().join("dns-ligase-test-plan-merge");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1117,7 +1086,7 @@ mod tests {
                     etag: None,
                 }),
                 (stale_url.to_string(), DownloadResult::NotModified),
-                (deadish_url.to_string(), DownloadResult::StaleFallback("deadish-body\n".to_string())),
+                (deadish_url.to_string(), DownloadResult::StaleFallback { body: "deadish-body\n".to_string(), error: "offline".to_string() }),
                 ("https://dead.example/y.txt".to_string(), DownloadResult::Failed("boom".to_string())),
             ],
             path_str,
@@ -1306,3 +1275,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+#[cfg(test)]
+#[path = "fetch_tests.rs"]
+mod fetch_tests;

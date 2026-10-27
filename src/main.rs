@@ -171,7 +171,7 @@ async fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
 
 /// Create a Blocklist from config: manual rules + all blocklist URLs (cached or fresh).
 /// List hostnames are resolved through `upstream` (not the system resolver).
-async fn create_blocklist(config: &Config, cache: &Mutex<CachedLists>, cache_path: &str, upstream: &Upstream) -> Blocklist {
+async fn create_blocklist(config: &Config, cache: &Mutex<CachedLists>, cache_path: &str, upstream: &Arc<Upstream>) -> Blocklist {
     let mut bl = Blocklist::new();
 
     // 1. Apply manual rules. Config entries are hand-edited, so invalid
@@ -216,7 +216,7 @@ async fn create_blocklist(config: &Config, cache: &Mutex<CachedLists>, cache_pat
     let (fresh, jobs) = {
         cache.lock().await.plan_fetches(&all_urls, cache_ttl, cache_path)
     };
-    let downloaded = CachedLists::download_jobs(jobs, cache_path, upstream).await;
+    let downloaded = CachedLists::download_jobs(jobs, cache_path, Arc::clone(upstream)).await;
     let merged = {
         cache.lock().await.merge_downloads(downloaded, cache_path)
     };

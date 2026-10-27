@@ -914,6 +914,7 @@ name = "rust_dns"
 version = "0.5.0"
 dependencies = [
  "env_logger",
+ "hyper",
  "log",
  "mimalloc",
  "regex",
@@ -922,7 +923,6 @@ dependencies = [
  "serde_json",
  "tokio",
  "toml",
- "url",
 ]
 
 [[package]]

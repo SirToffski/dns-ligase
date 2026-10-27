@@ -74,7 +74,13 @@ impl Upstream {
         let id = INTERNAL_QUERY_ID.fetch_add(1, Ordering::Relaxed);
         let query = DnsMessage::new_query(id, host, 1);
         let wire = query.serialize()?;
-        let resp_bytes = self.udp_query(&wire).await?;
+        let mut resp_bytes = self.udp_query(&wire).await?;
+        if tc_bit_set(&resp_bytes) {
+            resp_bytes = self.tcp_query(&wire).await?;
+        }
+        if tc_bit_set(&resp_bytes) {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Truncated bootstrap DNS response"));
+        }
         let resp = DnsMessage::parse(&resp_bytes)?;
         Ok(resp.a_records())
     }

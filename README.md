@@ -71,8 +71,9 @@ List refreshes fetch all URLs concurrently and never hold the cache lock across 
 - List bodies cached on disk, surviving restarts: `cache.json` holds per-URL metadata (fetch time, ETag, filename) and a `cache.d/` directory next to it holds the raw list text files (e.g. with `path = "/var/lib/dns-ligase/cache.json"`, bodies live in `/var/lib/dns-ligase/cache.d/`)
 - Conditional GETs with `If-None-Match`; a `304` skips the download entirely
 - Configurable freshness window (`cache_ttl_secs`) — lists within it aren't refetched
-- On fetch failure (network error or HTTP 4xx/5xx), the last good copy is used rather than silently dropping thousands of rules
-- List hostnames resolve through the configured `[upstream]`, not the system resolver — so dns-ligase can itself be the system resolver without deadlocking at boot
+- On fetch failure (including an incomplete response body), the last good copy is used. A valid download remains usable even if saving its cache file fails; cache files are replaced atomically and failed metadata saves are retried.
+- List requests have a 5-second connection timeout and a 30-second overall deadline, including any missing-body conditional-GET retry.
+- All list hostnames, including redirect destinations, resolve through the configured `[upstream]`, with TCP fallback for truncated DNS replies. Fetches connect directly without environment proxies or system-resolver fallback, so dns-ligase can itself be the system resolver without a circular dependency.
 - Entries for URLs removed from config are pruned automatically
 
 **DNS**
