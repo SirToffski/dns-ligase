@@ -18,3 +18,15 @@ regex_block = ["^(.+[_.-])?telemetry[_.-]"]
 # Regex strings: '\.' in single quotes equals "\\." in double quotes.
 # Regexes use regex syntax, not shell globs such as "*.example.com".
 regex_allow = []
+
+# Optional per-client policy. Sources are IPs or CIDR ranges.
+# [clients]
+# Forward everything from these sources with no filtering at all.
+# unfiltered = ["192.168.2.54", "192.168.2.53"]
+#
+# Allow rules for specific sources only; everyone else stays filtered.
+# Repeat [[clients.allow]] for more groups.
+# [[clients.allow]]
+# sources = ["192.168.2.60"]
+# domains = ["ads.example.com", "||tracking.example.net^"]  # exact, or ||x^ for x + subdomains
+# regex = ['(^|\.)metrics\.example\.org$']

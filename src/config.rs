@@ -18,6 +18,31 @@ pub struct Config {
     pub cache: CacheConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub clients: ClientsConfig,
+}
+
+/// Per-client policy. Entries are IP addresses or CIDR ranges.
+#[derive(Debug, Clone, Deserialize, Default, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ClientsConfig {
+    /// Sources whose queries skip all filtering and are forwarded as-is.
+    #[serde(default)]
+    pub unfiltered: Vec<String>,
+    /// Allow rules that apply only to the listed sources.
+    #[serde(default)]
+    pub allow: Vec<ClientAllowConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ClientAllowConfig {
+    pub sources: Vec<String>,
+    /// `example.com` (exact) or `||example.com^` (domain and subdomains).
+    #[serde(default)]
+    pub domains: Vec<String>,
+    #[serde(default)]
+    pub regex: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -119,6 +144,35 @@ regex_allow = []
         assert!(cfg.blocklists.regex_block_urls.is_empty());
         assert!(cfg.blocklists.regex_allow_urls.is_empty());
         assert!(cfg.blocklists.allowlist_urls.is_empty());
+        assert_eq!(cfg.clients, ClientsConfig::default());
+    }
+
+    #[test]
+    fn test_clients_parse() {
+        let toml = format!(
+            r#"{}
+[clients]
+unfiltered = ["192.168.2.54", "192.168.2.53"]
+
+[[clients.allow]]
+sources = ["192.168.2.60"]
+domains = ["a.test"]
+
+[[clients.allow]]
+sources = ["10.0.0.0/8"]
+regex = ['^b\.test$']
+"#,
+            minimal_toml()
+        );
+        let cfg: Config = toml::from_str(&toml).unwrap();
+        assert_eq!(cfg.clients.unfiltered, vec!["192.168.2.54", "192.168.2.53"]);
+        assert_eq!(cfg.clients.allow.len(), 2);
+        assert_eq!(cfg.clients.allow[0].domains, vec!["a.test"]);
+        assert!(cfg.clients.allow[0].regex.is_empty());
+        assert_eq!(cfg.clients.allow[1].regex, vec![r"^b\.test$"]);
+        // A typo must not silently disable a client rule.
+        let typo = format!("{}\n[clients]\nunfilterd = [\"192.168.2.54\"]\n", minimal_toml());
+        assert!(toml::from_str::<Config>(&typo).is_err());
     }
 
     #[test]

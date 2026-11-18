@@ -1,4 +1,5 @@
 mod blocklist;
+mod clients;
 mod config;
 mod dns;
 mod journald;
@@ -54,6 +55,7 @@ fn run_stats_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             "--blocked" => filter.blocked = true,
             "--allowed" => filter.allowed = true,
             "--forwarded" => filter.forwarded = true,
+            "--bypassed" => filter.bypassed = true,
             "--summary" => filter.summary = true,
             "--domain" | "-d" => {
                 i += 1;
@@ -74,6 +76,7 @@ fn run_stats_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 println!("  --blocked       Show only blocked queries");
                 println!("  --allowed       Show only allowed queries");
                 println!("  --forwarded     Show only forwarded queries");
+                println!("  --bypassed      Show only queries from unfiltered clients");
                 println!("  --domain <str>  Filter by domain substring");
                 println!("  --src <ip>      Filter by source IP substring");
                 println!("  --since <time>  journalctl time spec (e.g. \"1 hour ago\")");

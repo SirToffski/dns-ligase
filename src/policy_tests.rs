@@ -71,10 +71,13 @@ async fn replies() -> Replies {
         tasks: vec![udp_task, tcp_task],
     }
 }
+const LOCAL: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
 fn state(addr: SocketAddr, rules: Blocklist) -> QueryState {
     QueryState {
         upstream: Arc::new(Upstream::new(addr)),
         blocklist: Arc::new(rules),
+        clients: Arc::default(),
         log_queries: true,
     }
 }
@@ -83,6 +86,14 @@ async fn recorded(
     name: &str,
     transport: ClientTransport,
 ) -> (DnsMessage, Vec<(String, String, String)>) {
+    recorded_from(state, name, transport, "127.0.0.1:10000").await
+}
+async fn recorded_from(
+    state: &QueryState,
+    name: &str,
+    transport: ClientTransport,
+    client: &str,
+) -> (DnsMessage, Vec<(String, String, String)>) {
     let wire = DnsMessage::new_query(1, name, 1).serialize().unwrap();
     let output = std::sync::Mutex::new(None);
     let mut logs = Vec::new();
@@ -90,7 +101,7 @@ async fn recorded(
         &wire,
         state,
         transport,
-        "127.0.0.1:10000".parse().unwrap(),
+        client.parse().unwrap(),
         |wire| {
             std::future::ready({
                 *output.lock().unwrap() = Some(wire);
@@ -191,6 +202,77 @@ async fn unmatched_cnames_block_and_plain_queries_forward_with_one_log() {
     }
 }
 
+fn client_state(addr: SocketAddr) -> QueryState {
+    let mut rules = Blocklist::new();
+    rules
+        .block_domains
+        .extend(["tracker.test".into(), "site.test".into()]);
+    let clients = crate::config::ClientsConfig {
+        unfiltered: vec!["192.0.2.53".into(), "198.51.100.0/24".into()],
+        allow: vec![crate::config::ClientAllowConfig {
+            sources: vec!["192.0.2.60".into()],
+            domains: vec!["site.test".into()],
+            regex: vec![],
+        }],
+    };
+    QueryState {
+        clients: Arc::new(crate::clients::ClientPolicy::from_config(&clients).unwrap()),
+        ..state(addr, rules)
+    }
+}
+
+#[tokio::test]
+async fn unfiltered_clients_skip_name_and_cname_blocks() {
+    let server = replies().await;
+    let state = client_state(server.addr);
+    for transport in [ClientTransport::Udp, ClientTransport::Tcp] {
+        for (client, entry) in [
+            ("192.0.2.53:5000", "192.0.2.53"),
+            ("198.51.100.7:5000", "198.51.100.0/24"),
+            ("[::ffff:192.0.2.53]:5000", "192.0.2.53"),
+        ] {
+            // Directly blocked name, and a name whose CNAME target is blocked.
+            for name in ["tracker.test", "other.test"] {
+                let (response, logs) = recorded_from(&state, name, transport, client).await;
+                assert_eq!(response.header.flags & 15, 0, "{client} {name}");
+                assert_eq!(
+                    logs,
+                    vec![(name.into(), "bypassed".into(), format!("client_bypass:{entry}"))]
+                );
+            }
+        }
+        // Everyone else is still filtered.
+        let (response, logs) = recorded_from(&state, "tracker.test", transport, "192.0.2.99:5000").await;
+        assert_eq!(response.header.flags & 15, 3);
+        assert_eq!(logs[0].1, "blocked");
+    }
+}
+
+#[tokio::test]
+async fn per_client_allow_overrides_global_block_only_for_that_client() {
+    let server = replies().await;
+    let state = client_state(server.addr);
+    for transport in [ClientTransport::Udp, ClientTransport::Tcp] {
+        // site.test is globally blocked and CNAMEs to a blocked tracker; the
+        // per-client allow exempts both, like a global allow rule would.
+        let (response, logs) = recorded_from(&state, "site.test", transport, "192.0.2.60:5000").await;
+        assert_eq!(response.header.flags & 15, 0);
+        assert_eq!(response.answers[0].cname_target.as_deref(), Some("tracker.test"));
+        assert_eq!(
+            logs,
+            vec![("site.test".into(), "allowed".into(), "client_allow:site.test".into())]
+        );
+        // The allowed client keeps normal filtering for other names.
+        let (response, logs) = recorded_from(&state, "tracker.test", transport, "192.0.2.60:5000").await;
+        assert_eq!(response.header.flags & 15, 3);
+        assert_eq!(logs[0].1, "blocked");
+        // Other clients are still blocked for the allowed name.
+        let (response, logs) = recorded_from(&state, "site.test", transport, "192.0.2.61:5000").await;
+        assert_eq!(response.header.flags & 15, 3);
+        assert_eq!(logs[0].2, "block:site.test");
+    }
+}
+
 #[tokio::test]
 async fn allowed_names_preserve_upstream_errors() {
     let server = replies().await;
@@ -242,14 +324,14 @@ async fn ambiguous_or_response_shaped_requests_are_rejected_before_filtering() {
     let mut query = DnsMessage::new_query(1, "plain.test", 1);
     query.questions.push(query.questions[0].clone());
     assert!(
-        process_query(&query.serialize().unwrap(), &state, ClientTransport::Udp)
+        process_query(&query.serialize().unwrap(), &state, ClientTransport::Udp, LOCAL)
             .await
             .is_err()
     );
     query.questions.pop();
     query.header.flags |= 0x8000;
     assert!(
-        process_query(&query.serialize().unwrap(), &state, ClientTransport::Tcp)
+        process_query(&query.serialize().unwrap(), &state, ClientTransport::Tcp, LOCAL)
             .await
             .is_err()
     );

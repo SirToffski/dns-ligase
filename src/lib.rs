@@ -1,5 +1,6 @@
 pub mod dns;
 pub mod blocklist;
+pub mod clients;
 pub mod config;
 pub mod upstream;
 pub mod journald;

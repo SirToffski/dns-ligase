@@ -41,6 +41,7 @@ pub struct StatsFilter {
     pub blocked: bool,
     pub allowed: bool,
     pub forwarded: bool,
+    pub bypassed: bool,
     pub domain: Option<String>,
     pub src: Option<String>,
     pub since: Option<String>,
@@ -49,11 +50,12 @@ pub struct StatsFilter {
 
 impl StatsFilter {
     fn matches(&self, entry: &QueryEntry) -> bool {
-        let any_action = self.blocked || self.allowed || self.forwarded;
+        let any_action = self.blocked || self.allowed || self.forwarded || self.bypassed;
         (!any_action
             || (self.blocked && entry.action == "blocked")
             || (self.allowed && entry.action == "allowed")
-            || (self.forwarded && entry.action == "forwarded"))
+            || (self.forwarded && entry.action == "forwarded")
+            || (self.bypassed && entry.action == "bypassed"))
             && self
                 .domain
                 .as_ref()
@@ -265,6 +267,7 @@ fn journal_command(filter: &StatsFilter) -> Command {
         (filter.blocked, "blocked"),
         (filter.allowed, "allowed"),
         (filter.forwarded, "forwarded"),
+        (filter.bypassed, "bypassed"),
     ] {
         if selected {
             command.arg(format!("QUERY_ACTION={action}"));

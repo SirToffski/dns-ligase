@@ -31,6 +31,7 @@ client → UDP/TCP listener → parse DNS wire format → extract QNAME
 | `upstream.rs` | Upstream connection pool (UDP + TCP, shared across queries), UDP and TCP listeners, blocklist check, NXDOMAIN construction, DO-bit injection, forwarding, truncation/TCP fallback, timeouts, query logging. |
 | `journald.rs` | Minimal journald native protocol sender for structured query logs (no external crate). |
 | `stats.rs` | `stats` subcommand: reads journald JSON, filters by action/domain/source/time, prints table or summary. |
+| `clients.rs` | Per-client policy: unfiltered sources and source-scoped allow rules, with IP/CIDR matching. |
 | `config.rs` | TOML config structs. |
 | `main.rs` | Startup, listener wiring, signal registration, `stats` subcommand dispatch. |
 | `reload.rs` | Cached startup rules, coordinated periodic refresh and SIGHUP reload, config validation, cache migration, SIGTERM persistence. |
@@ -66,6 +67,7 @@ Startup loads manual rules and all readable cached bodies, including stale ones,
 - Manual block/allow entries and regex rules from config
 - Regex block/allow lists fetched from URLs (one pattern per line, Pi-hole style)
 - Allow rules take precedence over block rules
+- Per-client policy (`[clients]`): listed sources can skip filtering entirely, or get extra allow rules that apply only to them. See [Per-client rules](#per-client-rules).
 - An allow-rule match on the requested name exempts that query from CNAME filtering, including exact, suffix and regex allow rules from config or lists. It does not allow the target for unrelated queries, and upstream NXDOMAIN/SERVFAIL still pass through.
 - Other responses are scanned for CNAME-cloaked trackers: a blocked CNAME target means NXDOMAIN
 - Hosts-file aliases are all parsed. Malformed rules are skipped safely; invalid remote regexes report their URL, line and skipped count (details limited to the first 10 per list).
@@ -107,7 +109,7 @@ Startup loads manual rules and all readable cached bodies, including stale ones,
 **Query logging**
 
 - Optional per-query logging to journald with structured fields, enabled via `[logging] queries = true`
-- Each log entry carries: source IP, domain, query type, action (blocked/allowed/forwarded), and the matched rule
+- Each log entry carries: source IP, domain, query type, action (blocked/allowed/forwarded/bypassed), and the matched rule
 - One filtering decision is logged per completed response. Failed delivery produces an operational error rather than a misleading success entry. Journal writes are nonblocking and best-effort; entries may be dropped if journald is unavailable or congested.
 - `dns-ligase stats` streams journal entries and prints rows as they arrive. Summaries retain counts per action/domain/source rather than every query. Exact action filters are sent to journalctl; domain and source filters remain case-sensitive substrings. Times are printed in UTC.
 - Filter options requiring a value (`--domain`, `--src`, `--since`) reject missing arguments. Closing a downstream pipe stops and reaps journalctl cleanly.
@@ -116,6 +118,7 @@ Startup loads manual rules and all readable cached bodies, including stale ones,
   dns-ligase stats                        # all recent queries
   dns-ligase stats --blocked              # blocked only
   dns-ligase stats --src 192.168.1.5      # from a specific client
+  dns-ligase stats --bypassed             # queries from [clients] unfiltered sources
   dns-ligase stats --domain ads --blocked # blocked queries with "ads" in the domain
   dns-ligase stats --since "1 hour ago"   # time window (journalctl syntax)
   dns-ligase stats --summary              # aggregate: totals, top blocked, top sources
@@ -220,9 +223,29 @@ regex_allow = []
 
 [logging]
 # Enable per-query logging to journald with structured fields.
-# View with: dns-ligase stats [--blocked|--allowed|--src|--domain|--summary]
+# View with: dns-ligase stats [--blocked|--allowed|--bypassed|--src|--domain|--summary]
 queries = false
+
+[clients]
+# Optional. See "Per-client rules" below.
+# unfiltered = ["192.168.2.54", "192.168.2.53"]
+#
+# [[clients.allow]]
+# sources = ["192.168.2.60"]
+# domains = ["ads.example.com", "||tracking.example.net^"]
+# regex   = ['(^|\.)metrics\.example\.org$']
 ```
+
+### Per-client rules
+
+Sources are IP addresses or CIDR ranges (`192.168.2.54`, `192.168.2.0/24`, `fd00::/8`). IPv4 clients reaching an IPv6 listener as `::ffff:a.b.c.d` match their IPv4 entries.
+
+- **`unfiltered`** — every query from these sources is forwarded to `[upstream]` with no filtering at all: no block rules, no CNAME check. Logged with action `bypassed` and rule `client_bypass:<entry>`.
+- **`[[clients.allow]]`** — allow rules that apply only to the group's `sources`; every other client is filtered normally, and these sources stay filtered for anything the group doesn't match. A match beats global block rules and exempts the query from CNAME filtering, exactly like a global allow. `domains` entries are exact (`example.com`) or domain-plus-subdomains (`||example.com^`); `regex` entries use the same syntax as `regex_allow`. Logged as `allowed` with a `client_` rule prefix, e.g. `client_allow:ads.example.com`. Repeat the table for more groups; a source in several groups gets the union of their rules.
+
+Precedence for a query: client `unfiltered` → that client's `allow` groups → global allow → global block → forward. Client rules never block anything.
+
+Unknown keys under `[clients]` (e.g. a typo like `unfilterd`) are an error rather than silently ignored, as are invalid addresses, empty groups, and invalid regexes — startup fails or the reload is rejected with the active state kept. Client rules reload with `SIGHUP`.
 
 TOML single-quoted strings preserve backslashes. For example, `'^ads\.example\.com$'` and `"^ads\\.example\\.com$"` are equivalent regexes. A glob such as `"*.example.com"` is not a valid regex; use `'(^|\.)example\.com$'` for that domain and its subdomains. Invalid manual regexes reject startup/reload; unsupported remote patterns (including lookaround) are skipped with diagnostics rather than silently rewritten.
 

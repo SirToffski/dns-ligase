@@ -11,6 +11,7 @@ use crate::blocklist::{
     parse_lines_into, parse_lines_into_allow, parse_lines_into_regex, Blocklist, CachedLists,
     DownloadResult, FetchJob, ListFormat,
 };
+use crate::clients::ClientPolicy;
 use crate::config::Config;
 use crate::upstream::{QueryState, QueryStateHandle, Upstream};
 
@@ -24,6 +25,7 @@ struct PreparedUpdate {
     config: Config,
     cache: CachedLists,
     manual: Blocklist,
+    clients: Arc<ClientPolicy>,
     fresh: HashMap<String, String>,
     jobs: Vec<FetchJob>,
     upstream: Arc<Upstream>,
@@ -111,6 +113,18 @@ fn manual_rules(config: &Config) -> io::Result<Blocklist> {
     Ok(bl)
 }
 
+fn client_policy(config: &Config) -> io::Result<Arc<ClientPolicy>> {
+    let policy = ClientPolicy::from_config(&config.clients)?;
+    if !policy.is_empty() {
+        log::info!(
+            "Client policy: {} unfiltered, {} allow group(s)",
+            config.clients.unfiltered.len(),
+            config.clients.allow.len()
+        );
+    }
+    Ok(Arc::new(policy))
+}
+
 fn assemble(config: &Config, mut bl: Blocklist, bodies: &HashMap<String, String>) -> Blocklist {
     for url in &config.blocklists.urls {
         if let Some(body) = bodies.get(url) {
@@ -148,8 +162,9 @@ fn assemble(config: &Config, mut bl: Blocklist, bodies: &HashMap<String, String>
 
 impl ReloadManager {
     pub async fn new(config: Config) -> io::Result<Self> {
-        let (cache, bl, config) = blocking(move || {
+        let (cache, bl, clients, config) = blocking(move || {
             let manual = manual_rules(&config)?;
+            let clients = client_policy(&config)?;
             let cache = match CachedLists::load_from_disk(&config.cache.path) {
                 Ok(cache) => cache,
                 Err(e) => {
@@ -161,7 +176,7 @@ impl ReloadManager {
             };
             let bodies = cache.cached_bodies(&all_urls(&config), &config.cache.path);
             let bl = assemble(&config, manual, &bodies);
-            Ok((cache, bl, config))
+            Ok((cache, bl, clients, config))
         })
         .await?;
         let upstream = Arc::new(Upstream::new(
@@ -170,6 +185,7 @@ impl ReloadManager {
         let state = Arc::new(RwLock::new(Arc::new(QueryState {
             upstream,
             blocklist: Arc::new(bl),
+            clients,
             log_queries: config.logging.queries,
         })));
         Ok(Self {
@@ -192,6 +208,7 @@ impl ReloadManager {
         let upstream = self.state.read().await.upstream.clone();
         blocking(move || {
             let manual = manual_rules(&config)?;
+            let clients = client_policy(&config)?;
             let cache = if old_path != config.cache.path {
                 cache.migrate_to(&old_path, &config.cache.path, &all_urls(&config))?
             } else {
@@ -212,6 +229,7 @@ impl ReloadManager {
                 config,
                 cache,
                 manual,
+                clients,
                 fresh: fresh.into_iter().collect(),
                 jobs,
                 upstream,
@@ -241,6 +259,7 @@ impl ReloadManager {
             let state = Arc::new(QueryState {
                 upstream: update.upstream,
                 blocklist: Arc::new(bl),
+                clients: update.clients,
                 log_queries: update.config.logging.queries,
             });
             Ok((update.config, update.cache, state))
@@ -448,6 +467,23 @@ fn log_config_changes(old_config: &Config, new_config: &Config) {
     }
     for pattern in &old_regex_block - &new_regex_block {
         log::info!("Regex block removed: {}", pattern);
+    }
+
+    // Per-client policy
+    let old_unfiltered: HashSet<_> = old_config.clients.unfiltered.iter().collect();
+    let new_unfiltered: HashSet<_> = new_config.clients.unfiltered.iter().collect();
+    for source in &new_unfiltered - &old_unfiltered {
+        log::info!("Unfiltered client added: {}", source);
+    }
+    for source in &old_unfiltered - &new_unfiltered {
+        log::info!("Unfiltered client removed: {}", source);
+    }
+    if old_config.clients.allow != new_config.clients.allow {
+        log::info!(
+            "Per-client allow rules changed ({} -> {} group(s))",
+            old_config.clients.allow.len(),
+            new_config.clients.allow.len()
+        );
     }
 
     // Regex allow patterns

@@ -282,6 +282,8 @@ pub enum MatchOutcome {
     Allowed(String),
     /// Not matched by any rule; forward to upstream.
     Forwarded,
+    /// The client is configured to skip filtering entirely.
+    Bypassed(String),
 }
 
 /// Parse ordinary list bodies, preserving source/line context for bad rules.

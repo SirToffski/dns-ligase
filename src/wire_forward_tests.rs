@@ -114,6 +114,7 @@ async fn udp_size_normalization_and_tcp_fallback_work_end_to_end() {
     let state = Arc::new(RwLock::new(Arc::new(QueryState {
         upstream: Arc::new(Upstream::new(addr)),
         blocklist: Arc::new(Blocklist::new()),
+        clients: Arc::default(),
         log_queries: false,
     })));
     let forwarder = UdpForwarder::new("127.0.0.1:0", state).await.unwrap();

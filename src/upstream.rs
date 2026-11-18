@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -9,6 +9,7 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::time::{timeout, timeout_at, Duration, Instant};
 
 use crate::blocklist::{Blocklist, MatchOutcome};
+use crate::clients::ClientPolicy;
 use crate::dns::{query_with_edns, DnsHeader, DnsMessage, DnsQuestion, MAX_DNS_MESSAGE};
 use crate::journald;
 
@@ -307,6 +308,7 @@ impl Upstream {
 pub struct QueryState {
     pub upstream: Arc<Upstream>,
     pub blocklist: Arc<Blocklist>,
+    pub clients: Arc<ClientPolicy>,
     pub log_queries: bool,
 }
 
@@ -327,6 +329,7 @@ async fn process_query(
     packet: &[u8],
     state: &QueryState,
     transport: ClientTransport,
+    client: IpAddr,
 ) -> io::Result<QueryResult> {
     let (msg, opt_offset) = DnsMessage::parse_wire(packet)?;
     if msg.header.flags & 0xf800 != 0 || msg.questions.len() != 1 {
@@ -336,7 +339,11 @@ async fn process_query(
         ));
     }
     let question = msg.questions[0].clone();
-    let outcome = state.blocklist.check(&question.name);
+    // Client-specific bypass/allow overrides global rules; it never blocks.
+    let outcome = state
+        .clients
+        .check(client, &question.name)
+        .unwrap_or_else(|| state.blocklist.check(&question.name));
     if matches!(outcome, MatchOutcome::Blocked(_)) {
         log::info!("Blocking domain: {}", question.name);
         return Ok(QueryResult {
@@ -357,9 +364,10 @@ async fn process_query(
         }
         ClientTransport::Tcp => state.upstream.tcp_query(&outgoing).await?,
     };
-    // An actual allow rule for the requested name exempts this entire query
-    // from filtering. It does not allow the target for any other query.
-    if !matches!(outcome, MatchOutcome::Allowed(_)) {
+    // An actual allow rule for the requested name (or a bypassed client)
+    // exempts this entire query from filtering. It does not allow the target
+    // for any other query.
+    if matches!(outcome, MatchOutcome::Forwarded) {
         let response = DnsMessage::parse(&wire)?;
         for target in response
             .answers
@@ -405,13 +413,14 @@ where
         wire,
         question,
         outcome,
-    } = process_query(packet, state, transport).await?;
+    } = process_query(packet, state, transport, client.ip()).await?;
     send(wire).await?;
     if state.log_queries {
         let (action, rule) = match &outcome {
             MatchOutcome::Allowed(rule) => ("allowed", rule.as_str()),
             MatchOutcome::Blocked(rule) => ("blocked", rule.as_str()),
             MatchOutcome::Forwarded => ("forwarded", ""),
+            MatchOutcome::Bypassed(rule) => ("bypassed", rule.as_str()),
         };
         log(
             &client.ip().to_string(),
