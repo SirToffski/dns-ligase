@@ -8,8 +8,8 @@ use tokio::signal::unix::Signal;
 use tokio::sync::RwLock;
 
 use crate::blocklist::{
-    parse_lines_into, parse_lines_into_allow, parse_lines_into_regex, Blocklist, CachedLists,
-    DownloadResult, FetchJob, ListFormat,
+    parse_domain_lines, parse_lines_into_regex, validate_list, Blocklist, CachedLists,
+    DisabledRules, DownloadResult, FetchJob, ListFormat,
 };
 use crate::clients::ClientPolicy;
 use crate::config::Config;
@@ -90,10 +90,14 @@ fn manual_rules(config: &Config) -> io::Result<Blocklist> {
         )
     };
     let mut bl = Blocklist::new();
-    for entry in &config.matching.manual_block {
-        bl.parse_line(entry, ListFormat::AdBlock)
-            .map_err(|e| invalid("manual_block", entry, e.to_string()))?;
-    }
+    // Check local config before any I/O. Compile these entries into the serving
+    // rules after collecting badfilter directives from all available sources.
+    let mut disabled = DisabledRules::default();
+    disabled.collect(
+        config.matching.manual_block.iter().map(String::as_str),
+        false,
+    );
+    add_manual_blocks(&mut Blocklist::new(), config, &disabled)?;
     for entry in &config.matching.manual_allow {
         bl.allow_domains
             .insert(entry.to_lowercase().trim_end_matches('.').to_string());
@@ -125,17 +129,53 @@ fn client_policy(config: &Config) -> io::Result<Arc<ClientPolicy>> {
     Ok(Arc::new(policy))
 }
 
-fn assemble(config: &Config, mut bl: Blocklist, bodies: &HashMap<String, String>) -> Blocklist {
+fn add_manual_blocks(
+    bl: &mut Blocklist,
+    config: &Config,
+    disabled: &DisabledRules,
+) -> io::Result<()> {
+    for entry in &config.matching.manual_block {
+        if !disabled.skips(entry, false) {
+            bl.parse_line(entry, ListFormat::AdBlock).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("invalid manual_block entry {entry:?}: {e}"),
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn assemble(
+    config: &Config,
+    mut bl: Blocklist,
+    bodies: &HashMap<String, String>,
+) -> io::Result<Blocklist> {
+    let mut disabled = DisabledRules::default();
+    disabled.collect(
+        config.matching.manual_block.iter().map(String::as_str),
+        false,
+    );
+    for (urls, allow) in [
+        (&config.blocklists.urls, false),
+        (&config.blocklists.allowlist_urls, true),
+    ] {
+        for body in urls.iter().filter_map(|url| bodies.get(url)) {
+            disabled.collect(body.lines(), allow);
+        }
+    }
+    add_manual_blocks(&mut bl, config, &disabled)?;
     for url in &config.blocklists.urls {
         if let Some(body) = bodies.get(url) {
-            parse_lines_into(&mut bl, body, url);
+            parse_domain_lines(&mut bl, body, false, url, &disabled);
         } else {
             log::warn!("Blocklist {url} has no usable copy; skipping");
         }
     }
     for url in &config.blocklists.allowlist_urls {
         if let Some(body) = bodies.get(url) {
-            parse_lines_into_allow(&mut bl, body, url);
+            parse_domain_lines(&mut bl, body, true, url, &disabled);
         } else {
             log::warn!("Allowlist {url} has no usable copy; skipping");
         }
@@ -153,11 +193,11 @@ fn assemble(config: &Config, mut bl: Blocklist, bodies: &HashMap<String, String>
         }
     }
     log::info!(
-        "Blocklist: {} block exact, {} block suffix, {} block regex, {} allow exact, {} allow suffix, {} allow regex",
-        bl.block_domains.len(), bl.block_suffixes.len(), bl.block_regex.len(),
+        "Blocklist: {} rules including type-specific rules ({} block exact, {} block suffix, {} block regex, {} allow exact, {} allow suffix, {} allow regex)",
+        bl.rule_count(), bl.block_domains.len(), bl.block_suffixes.len(), bl.block_regex.len(),
         bl.allow_domains.len(), bl.allow_suffixes.len(), bl.allow_regex.len()
     );
-    bl
+    Ok(bl)
 }
 
 impl ReloadManager {
@@ -175,7 +215,7 @@ impl ReloadManager {
                 }
             };
             let bodies = cache.cached_bodies(&all_urls(&config), &config.cache.path);
-            let bl = assemble(&config, manual, &bodies);
+            let bl = assemble(&config, manual, &bodies)?;
             Ok((cache, bl, clients, config))
         })
         .await?;
@@ -244,12 +284,20 @@ impl ReloadManager {
         downloaded: Vec<(String, DownloadResult)>,
     ) -> io::Result<()> {
         let (config, cache, state) = blocking(move || {
-            update.fresh.extend(
-                update
-                    .cache
-                    .merge_downloads(downloaded, &update.config.cache.path),
-            );
-            let bl = assemble(&update.config, update.manual, &update.fresh);
+            update.fresh.extend(update.cache.merge_validated(
+                downloaded,
+                &update.config.cache.path,
+                |url, body| {
+                    let lists = &update.config.blocklists;
+                    let uses = |urls: &[String]| urls.iter().any(|s| s == url);
+                    validate_list(
+                        body,
+                        uses(&lists.urls) || uses(&lists.allowlist_urls),
+                        uses(&lists.regex_block_urls) || uses(&lists.regex_allow_urls),
+                    )
+                },
+            ));
+            let bl = assemble(&update.config, update.manual, &update.fresh)?;
             update
                 .cache
                 .prune(&all_urls(&update.config), &update.config.cache.path);

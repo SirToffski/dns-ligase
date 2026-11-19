@@ -31,6 +31,12 @@ fn reply(wire: &[u8]) -> Vec<u8> {
             rdata: crate::dns::serialize_name("tracker.test").unwrap(),
             cname_target: Some("tracker.test".into()),
         });
+        if msg.questions[0].name == "chain.test" {
+            let mut next = msg.answers[0].clone();
+            next.name = "tracker.test".into();
+            next.cname_target = Some("last.test".into());
+            msg.answers.push(next);
+        }
     }
     msg.serialize().unwrap()
 }
@@ -270,6 +276,65 @@ async fn per_client_allow_overrides_global_block_only_for_that_client() {
         let (response, logs) = recorded_from(&state, "site.test", transport, "192.0.2.61:5000").await;
         assert_eq!(response.header.flags & 15, 3);
         assert_eq!(logs[0].2, "block:site.test");
+    }
+}
+
+#[tokio::test]
+async fn client_exception_applies_to_each_cname_target_individually() {
+    let server = replies().await;
+    let mut rules = Blocklist::new();
+    rules
+        .block_domains
+        .extend(["tracker.test".into(), "last.test".into()]);
+    let mut state = state(server.addr, rules);
+    let clients = crate::config::ClientsConfig {
+        allow: vec![crate::config::ClientAllowConfig {
+            sources: vec!["192.0.2.60".into()],
+            domains: vec!["tracker.test".into()],
+            regex: vec![],
+        }],
+        ..Default::default()
+    };
+    state.clients = Arc::new(ClientPolicy::from_config(&clients).unwrap());
+    for transport in [ClientTransport::Udp, ClientTransport::Tcp] {
+        for (source, name, rcode) in [
+            ("192.0.2.60:5000", "alias.test", 0),
+            ("192.0.2.61:5000", "alias.test", 3),
+            ("192.0.2.60:5000", "chain.test", 3),
+        ] {
+            let (response, logs) = recorded_from(&state, name, transport, source).await;
+            assert_eq!(response.header.flags & 15, rcode);
+            if name == "chain.test" {
+                assert!(logs[0].2.contains("cname:last.test"));
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn typed_blocks_use_the_question_or_cname_record_type() {
+    let server = replies().await;
+    let mut rules = Blocklist::new();
+    rules.parse_auto("||plain.test^$dnstype=AAAA").unwrap();
+    rules.parse_auto("||tracker.test^$dnstype=CNAME").unwrap();
+    let state = state(server.addr, rules);
+    for transport in [ClientTransport::Udp, ClientTransport::Tcp] {
+        for (name, qtype, blocked) in [
+            ("plain.test", 1, false),
+            ("plain.test", 28, true),
+            ("alias.test", 1, true),
+        ] {
+            let wire = DnsMessage::new_query(17, name, qtype).serialize().unwrap();
+            let result = process_query(&wire, &state, transport, LOCAL)
+                .await
+                .unwrap();
+            let msg = DnsMessage::parse(&result.wire).unwrap();
+            assert_eq!(msg.header.flags & 15, 0);
+            assert_eq!(!matches!(result.outcome, MatchOutcome::Forwarded), blocked);
+            if blocked {
+                assert!(msg.answers.is_empty());
+            }
+        }
     }
 }
 

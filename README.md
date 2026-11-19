@@ -1,6 +1,6 @@
 # dns-ligase
 
-A small DNS filtering forwarder written in Rust. It listens for DNS queries on UDP and TCP, checks the requested domain against blocklists and allowlists, returns `NXDOMAIN` for anything blocked, and forwards everything else to an upstream resolver.
+A small DNS filtering forwarder written in Rust. It listens for DNS queries on UDP and TCP, checks the requested name and record type against blocklists and allowlists, and forwards permitted queries to an upstream resolver. Domain-wide blocks return `NXDOMAIN`. Type-specific blocks return an empty `NOERROR` answer (NODATA) so other record types can still resolve.
 
 It is intended to sit in front of a local validating resolver (unbound) as a lightweight replacement for AdGuard Home — no web UI, no admin API, no auto-updater, no third-party binary in the DNS path for the whole LAN.
 
@@ -38,17 +38,20 @@ client → UDP/TCP listener → parse DNS wire format → extract QNAME
 
 ### Matching
 
-Rules are stored in three shapes, checked with allow always beating block:
+Allow rules take precedence over matching block rules.
 
 | Shape | Source | Storage | Cost per query |
 | --- | --- | --- | --- |
 | Exact domain | hosts files, bare domains | `HashSet<String>` | one hash lookup |
 | Domain + subdomains | `\|\|domain^` AdBlock rules | `HashSet<String>` | one lookup per label |
+| Domain + subdomains by record type | `\|\|domain^$dnstype=AAAA` | suffix map with type lists | one lookup per label, then check matching entries |
 | Pattern | `/regex/` rules, config regexes | `Vec<Regex>` | linear scan |
 
 `||domain^` rules are the overwhelming bulk of any real blocklist, and they mean exactly "this domain or any subdomain" — so they go into a suffix set matched by walking labels off the query name, not into compiled regexes. Compiling ~100k rules into individual `Regex` objects previously cost 1.5 GB of RAM and a linear scan on every query; the suffix set does the same job in tens of MB with a handful of hash lookups.
 
 ### Concurrency
+
+The listeners admit up to 128 UDP handlers and 64 TCP clients. At capacity, UDP datagrams wait in the kernel receive buffer and TCP connections wait in the listen backlog. A full UDP buffer can drop datagrams. Each upstream pool shares 128 active exchange slots across UDP, TCP and list-host lookups. Waiting for an upstream slot counts toward the exchange's two-second deadline.
 
 Each query takes a brief read lock to clone one immutable serving snapshot: rules, upstream pool, and query-logging setting. It keeps that snapshot across upstream I/O and CNAME checks. Rebuilds publish a complete replacement under the same lock; in-flight queries finish with their original snapshot.
 
@@ -61,7 +64,9 @@ Startup loads manual rules and all readable cached bodies, including stale ones,
 **Filtering**
 
 - Blocklists and allowlists fetched from URLs over HTTPS
-- Formats: hosts files, AdBlock/uBO syntax (`||domain^` with `$options`, `@@` exceptions, `/regex/`), Pi-hole, AdGuard
+- Hosts files, bare domains, AdBlock domain suffixes, `@@` exceptions, and `/regex/` rules.
+- Suffix rules support `$dnstype` on requests and on CNAME targets. For example, `||host.example^$dnstype=AAAA` blocks IPv6 address lookups. Use `|` for several types and `~` for exclusions. Explicit inclusions take precedence in a mixed list. Common DNS type names and numeric `TYPE<number>` notation are accepted.
+- `$badfilter` cancels the matching rule text across the configured domain feeds and manual block entries, independent of list order. Unsupported modifiers are skipped with diagnostics in remote feeds and rejected in manual rules.
 - Format auto-detection per line; cosmetic/scriptlet rules (`##`, `#$#`, …) ignored rather than misparsed
 - Local names (`localhost`, `broadcasthost`, …) from hosts-file headers are never blocked
 - Manual block/allow entries and regex rules from config
@@ -69,7 +74,7 @@ Startup loads manual rules and all readable cached bodies, including stale ones,
 - Allow rules take precedence over block rules
 - Per-client policy (`[clients]`): listed sources can skip filtering entirely, or get extra allow rules that apply only to them. See [Per-client rules](#per-client-rules).
 - An allow-rule match on the requested name exempts that query from CNAME filtering, including exact, suffix and regex allow rules from config or lists. It does not allow the target for unrelated queries, and upstream NXDOMAIN/SERVFAIL still pass through.
-- Other responses are scanned for CNAME-cloaked trackers: a blocked CNAME target means NXDOMAIN
+- For other responses, each CNAME target is checked against the querying client's exceptions and the global rules. Allowing one target still permits filtering of later targets in the chain.
 - Hosts-file aliases are all parsed. Malformed rules are skipped safely; invalid remote regexes report their URL, line and skipped count (details limited to the first 10 per list).
 - Periodic background refresh with atomic swap
 
@@ -77,6 +82,7 @@ Startup loads manual rules and all readable cached bodies, including stale ones,
 
 - List bodies cached on disk, surviving restarts: `cache.json` holds per-URL metadata (fetch time, ETag, filename) and a `cache.d/` directory next to it holds the raw list text files (e.g. with `path = "/var/lib/dns-ligase/cache.json"`, bodies live in `/var/lib/dns-ligase/cache.d/`)
 - Conditional GETs with `If-None-Match`; a `304` skips the download entirely
+- A replacement must contain a usable rule in each format configured for that URL. Empty, comment-only, HTML, and wholly unusable downloads retain the previous body and ETag. To intentionally retire a feed, remove its URL from the config and reload.
 - Configurable freshness window (`cache_ttl_secs`) — lists within it aren't refetched
 - On fetch failure (including an incomplete response body), the last good copy is used. A valid download remains usable even if saving its cache file fails; cache files are replaced atomically and failed metadata saves are retried.
 - List requests have a 5-second connection timeout and a 30-second overall deadline, including any missing-body conditional-GET retry.

@@ -317,3 +317,64 @@ fn serialization_rejects_a_message_that_exceeds_tcp_length() {
     assert!(msg.serialize().is_err());
     assert_eq!(EDNS_DO.to_be_bytes(), [0, 0, 0x80, 0]);
 }
+
+#[tokio::test]
+async fn saturated_listener_waits_for_capacity_and_resumes_on_release() {
+    let mut rules = Blocklist::new();
+    rules.block_domains.insert("blocked.test".into());
+    let state = QueryState {
+        upstream: Arc::new(Upstream::new("127.0.0.1:1".parse().unwrap())),
+        blocklist: Arc::new(rules),
+        clients: Arc::default(),
+        log_queries: false,
+    };
+    let fwd = UdpForwarder::new("127.0.0.1:0", Arc::new(RwLock::new(Arc::new(state))))
+        .await
+        .unwrap();
+    let addr = fwd.udp_socket.local_addr().unwrap();
+    let udp_slots = fwd
+        .udp_handlers
+        .clone()
+        .acquire_many_owned(MAX_UDP_HANDLERS as u32)
+        .await
+        .unwrap();
+    let tcp_slots = fwd
+        .tcp_clients
+        .clone()
+        .acquire_many_owned(MAX_TCP_CLIENTS as u32)
+        .await
+        .unwrap();
+    let server = tokio::spawn(async move { fwd.run().await.unwrap() });
+    let packet = DnsMessage::new_query(7, "blocked.test", 1)
+        .serialize()
+        .unwrap();
+    let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    udp.send_to(&packet, addr).await.unwrap();
+    let mut tcp = TcpStream::connect(addr).await.unwrap();
+    write_tcp_message(&mut tcp, &packet).await.unwrap();
+    let mut buf = [0; 512];
+    assert!(timeout(Duration::from_millis(50), udp.recv(&mut buf))
+        .await
+        .is_err());
+    drop(udp_slots);
+    let n = timeout(Duration::from_secs(1), udp.recv(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        DnsMessage::parse(&buf[..n]).unwrap().header.flags & 15,
+        NXDOMAIN
+    );
+    assert!(timeout(Duration::from_millis(50), tcp.readable())
+        .await
+        .is_err());
+    drop(tcp_slots);
+    let wire = timeout(Duration::from_secs(1), read_tcp_frame(&mut tcp))
+        .await
+        .unwrap();
+    assert_eq!(
+        DnsMessage::parse(&wire).unwrap().header.flags & 15,
+        NXDOMAIN
+    );
+    server.abort();
+}

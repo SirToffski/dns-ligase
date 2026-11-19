@@ -5,13 +5,13 @@ use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, Semaphore};
 use tokio::time::{timeout, timeout_at, Duration, Instant};
 
 use crate::blocklist::{Blocklist, MatchOutcome};
 use crate::clients::ClientPolicy;
 use crate::dns::{
-    query_with_udp_size, DnsHeader, DnsMessage, DnsQuestion, EDNS_DO, MAX_DNS_MESSAGE,
+    qtype_str, query_with_udp_size, DnsHeader, DnsMessage, DnsQuestion, EDNS_DO, MAX_DNS_MESSAGE,
 };
 use crate::journald;
 
@@ -41,10 +41,12 @@ const MAX_UDP_PAYLOAD: usize = 65_507;
 /// connection (RFC 7766 idle timeout). A clean EOF or expiry here closes the
 /// connection normally — not an error.
 const CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-/// Max idle sockets kept per transport. On exhaustion a fresh connection is
-/// created rather than blocking, so a burst never stalls.
+// Idle pool sizes are separate from the number of simultaneous exchanges.
 const UDP_POOL_CAP: usize = 16;
 const TCP_POOL_CAP: usize = 8;
+const MAX_ACTIVE_EXCHANGES: usize = 128;
+const MAX_UDP_HANDLERS: usize = 128;
+const MAX_TCP_CLIENTS: usize = 64;
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
 /// Monotonic counter for internally-generated query IDs (e.g. resolve_a).
@@ -140,6 +142,7 @@ fn upstream_timeout(transport: &str) -> io::Error {
 /// less machinery.
 pub struct Upstream {
     addr: SocketAddr,
+    exchanges: Semaphore,
     udp_pool: Mutex<VecDeque<UdpSocket>>,
     tcp_pool: Mutex<VecDeque<TcpStream>>,
 }
@@ -148,6 +151,7 @@ impl Upstream {
     pub fn new(addr: SocketAddr) -> Self {
         Self {
             addr,
+            exchanges: Semaphore::new(MAX_ACTIVE_EXCHANGES),
             udp_pool: Mutex::new(VecDeque::new()),
             tcp_pool: Mutex::new(VecDeque::new()),
         }
@@ -203,6 +207,12 @@ impl Upstream {
         key: &QueryKey,
         deadline: Instant,
     ) -> io::Result<Vec<u8>> {
+        // The caller's deadline includes waiting for an exchange slot.
+        let _exchange = self
+            .exchanges
+            .acquire()
+            .await
+            .expect("semaphore stays open");
         // Drop the pool guard before binding or connecting a fresh socket.
         let pooled = self.udp_pool.lock().await.pop_back();
         let socket = match pooled {
@@ -261,6 +271,11 @@ impl Upstream {
         key: &QueryKey,
         deadline: Instant,
     ) -> io::Result<Vec<u8>> {
+        let _exchange = self
+            .exchanges
+            .acquire()
+            .await
+            .expect("semaphore stays open");
         let pooled = self.tcp_pool.lock().await.pop_back();
         if let Some(stream) = pooled {
             match Self::tcp_query_on(stream, query, key, deadline).await {
@@ -323,6 +338,14 @@ pub struct QueryState {
     pub log_queries: bool,
 }
 
+impl QueryState {
+    fn check(&self, client: IpAddr, name: &str, rtype: u16) -> MatchOutcome {
+        self.clients
+            .check(client, name)
+            .unwrap_or_else(|| self.blocklist.check_query(name, rtype))
+    }
+}
+
 #[derive(Clone, Copy)]
 enum ClientTransport {
     Udp,
@@ -351,14 +374,11 @@ async fn process_query(
     }
     let question = msg.questions[0].clone();
     // Client-specific bypass/allow overrides global rules; it never blocks.
-    let outcome = state
-        .clients
-        .check(client, &question.name)
-        .unwrap_or_else(|| state.blocklist.check(&question.name));
-    if matches!(outcome, MatchOutcome::Blocked(_)) {
+    let outcome = state.check(client, &question.name, question.qtype);
+    if let Some((rcode, _)) = block_decision(&outcome) {
         log::info!("Blocking domain: {}", question.name);
         return Ok(QueryResult {
-            wire: build_error_response(msg, NXDOMAIN)?,
+            wire: build_error_response(msg, rcode)?,
             question,
             outcome,
         });
@@ -392,12 +412,18 @@ async fn process_query(
             .iter()
             .filter_map(|rr| rr.cname_target.as_ref())
         {
-            if let MatchOutcome::Blocked(rule) = state.blocklist.check(target) {
+            let target_outcome = state.check(client, target, 5); // CNAME response record
+            if let Some((rcode, rule)) = block_decision(&target_outcome) {
                 log::info!("Blocking CNAME target {target} for {}", question.name);
+                let detail = format!("cname:{target} {rule}");
                 return Ok(QueryResult {
-                    wire: build_error_response(msg, NXDOMAIN)?,
+                    wire: build_error_response(msg, rcode)?,
                     question,
-                    outcome: MatchOutcome::Blocked(format!("cname:{target} {rule}")),
+                    outcome: if rcode == NXDOMAIN {
+                        MatchOutcome::Blocked(detail)
+                    } else {
+                        MatchOutcome::BlockedType(detail)
+                    },
                 });
             }
         }
@@ -436,7 +462,9 @@ where
     if state.log_queries {
         let (action, rule) = match &outcome {
             MatchOutcome::Allowed(rule) => ("allowed", rule.as_str()),
-            MatchOutcome::Blocked(rule) => ("blocked", rule.as_str()),
+            MatchOutcome::Blocked(rule) | MatchOutcome::BlockedType(rule) => {
+                ("blocked", rule.as_str())
+            }
             MatchOutcome::Forwarded => ("forwarded", ""),
             MatchOutcome::Bypassed(rule) => ("bypassed", rule.as_str()),
         };
@@ -454,6 +482,8 @@ where
 pub type QueryStateHandle = Arc<RwLock<Arc<QueryState>>>;
 
 pub struct UdpForwarder {
+    udp_handlers: Arc<Semaphore>,
+    tcp_clients: Arc<Semaphore>,
     udp_socket: Arc<UdpSocket>,
     tcp_listener: Arc<TcpListener>,
     state: QueryStateHandle,
@@ -466,6 +496,8 @@ impl UdpForwarder {
         // UDP address so port 0 also selects the same port for TCP.
         let listener = TcpListener::bind(socket.local_addr()?).await?;
         Ok(Self {
+            udp_handlers: Arc::new(Semaphore::new(MAX_UDP_HANDLERS)),
+            tcp_clients: Arc::new(Semaphore::new(MAX_TCP_CLIENTS)),
             udp_socket: Arc::new(socket),
             tcp_listener: Arc::new(listener),
             state,
@@ -478,16 +510,23 @@ impl UdpForwarder {
         // UDP Task
         let udp_socket = Arc::clone(&self.udp_socket);
         let state_udp = Arc::clone(&self.state);
+        let udp_handlers = self.udp_handlers.clone();
 
         tasks.push(tokio::spawn(async move {
             let mut buf = [0u8; 65535];
             loop {
+                let slot = udp_handlers
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .expect("semaphore stays open");
                 match udp_socket.recv_from(&mut buf).await {
                     Ok((len, addr)) => {
                         let packet = buf[..len].to_vec();
                         let state_ref = Arc::clone(&state_udp);
                         let socket_ref = Arc::clone(&udp_socket);
                         tokio::spawn(async move {
+                            let _slot = slot;
                             if let Err(e) =
                                 Self::handle_udp_query(socket_ref, state_ref, addr, packet).await
                             {
@@ -508,8 +547,14 @@ impl UdpForwarder {
         // TCP Task
         let listener = Arc::clone(&self.tcp_listener);
         let state_tcp = Arc::clone(&self.state);
+        let tcp_clients = self.tcp_clients.clone();
         tasks.push(tokio::spawn(async move {
             loop {
+                let slot = tcp_clients
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .expect("semaphore stays open");
                 let (mut stream, addr) = match listener.accept().await {
                     Ok(client) => client,
                     Err(e) => {
@@ -524,6 +569,7 @@ impl UdpForwarder {
                 }
                 let state_ref = Arc::clone(&state_tcp);
                 tokio::spawn(async move {
+                    let _slot = slot;
                     if let Err(e) = Self::handle_tcp_query(&mut stream, state_ref, addr).await {
                         log::error!("TCP query error: {e}");
                     }
@@ -597,27 +643,11 @@ impl UdpForwarder {
     }
 }
 
-/// Convert a DNS qtype number to a short string for logging.
-fn qtype_str(qtype: u16) -> &'static str {
-    match qtype {
-        1 => "A",
-        2 => "NS",
-        5 => "CNAME",
-        6 => "SOA",
-        12 => "PTR",
-        15 => "MX",
-        16 => "TXT",
-        28 => "AAAA",
-        33 => "SRV",
-        41 => "OPT",
-        43 => "DS",
-        46 => "RRSIG",
-        47 => "NSEC",
-        48 => "DNSKEY",
-        50 => "NSEC3",
-        52 => "TLSA",
-        255 => "ANY",
-        _ => "OTHER",
+fn block_decision(outcome: &MatchOutcome) -> Option<(u16, &str)> {
+    match outcome {
+        MatchOutcome::Blocked(rule) => Some((NXDOMAIN, rule)),
+        MatchOutcome::BlockedType(rule) => Some((0, rule)),
+        _ => None,
     }
 }
 

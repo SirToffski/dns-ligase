@@ -8,6 +8,42 @@ fn reply(query: &[u8]) -> DnsMessage {
     msg.header.flags = 0x8180;
     msg
 }
+
+#[tokio::test]
+async fn udp_and_tcp_share_the_upstream_limit_and_checkout_deadline() {
+    let server = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = server.local_addr().unwrap();
+    let socket = UdpSocket::bind(addr).await.unwrap();
+    let upstream = Upstream::new(addr);
+    let reserved = upstream
+        .exchanges
+        .acquire_many(MAX_ACTIVE_EXCHANGES as u32)
+        .await
+        .unwrap();
+    let wire = query(7, "waiting.test");
+    let (udp, tcp) = tokio::join!(upstream.udp_query(&wire), upstream.tcp_query(&wire));
+    assert_eq!(udp.unwrap_err().kind(), io::ErrorKind::TimedOut);
+    assert_eq!(tcp.unwrap_err().kind(), io::ErrorKind::TimedOut);
+    let mut buf = [0; 512];
+    assert_eq!(
+        socket.try_recv(&mut buf).unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    assert!(timeout(Duration::from_millis(50), server.accept())
+        .await
+        .is_err());
+    drop(reserved);
+    let respond = async {
+        let (len, peer) = socket.recv_from(&mut buf).await.unwrap();
+        socket
+            .send_to(&reply(&buf[..len]).serialize().unwrap(), peer)
+            .await
+            .unwrap();
+    };
+    let (response, ()) = tokio::join!(upstream.udp_query(&wire), respond);
+    assert_eq!(DnsMessage::parse(&response.unwrap()).unwrap().header.id, 7);
+    assert_eq!(upstream.exchanges.available_permits(), MAX_ACTIVE_EXCHANGES);
+}
 async fn read_frame(stream: &mut TcpStream) -> Vec<u8> {
     let len = stream.read_u16().await.unwrap() as usize;
     let mut query = vec![0; len];

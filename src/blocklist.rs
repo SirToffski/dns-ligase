@@ -14,6 +14,9 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::upstream::Upstream;
+mod adguard;
+pub(crate) use adguard::DisabledRules;
+use adguard::{split_options, TypedRule};
 
 #[derive(Debug, Default)]
 pub struct Blocklist {
@@ -23,6 +26,7 @@ pub struct Blocklist {
     pub block_suffixes: HashSet<String>,
     pub allow_regex: Vec<Regex>,
     pub block_regex: Vec<Regex>,
+    typed_suffixes: HashMap<String, Vec<TypedRule>>,
 }
 
 impl Blocklist {
@@ -32,12 +36,17 @@ impl Blocklist {
 
     #[allow(dead_code)]
     pub fn clear(&mut self) {
-        self.allow_domains.clear();
-        self.block_domains.clear();
-        self.allow_suffixes.clear();
-        self.block_suffixes.clear();
-        self.allow_regex.clear();
-        self.block_regex.clear();
+        *self = Self::default();
+    }
+
+    pub(crate) fn rule_count(&self) -> usize {
+        self.block_domains.len()
+            + self.allow_domains.len()
+            + self.block_suffixes.len()
+            + self.allow_suffixes.len()
+            + self.block_regex.len()
+            + self.allow_regex.len()
+            + self.typed_suffixes.values().map(Vec::len).sum::<usize>()
     }
 
     pub fn parse_line(&mut self, line: &str, format: ListFormat) -> Result<(), Box<dyn Error>> {
@@ -71,26 +80,28 @@ impl Blocklist {
                     line
                 };
 
-                if pattern_part.starts_with("||") {
-                    // AdBlock options (`$third-party`, `$important`, ...) are
-                    // content-type modifiers, not part of the domain. Without
-                    // stripping them the entry can never match a query name.
-                    let domain = pattern_part
-                        .trim_start_matches("||")
-                        .split('$')
-                        .next()
-                        .unwrap_or("")
-                        .trim_end_matches('^')
-                        .trim_end_matches('.')
-                        .to_lowercase();
-                    if domain.is_empty() {
-                        return Ok(());
+                let (pattern_part, options) = split_options(pattern_part);
+                if let Some(suffix) = pattern_part.strip_prefix("||") {
+                    let domain = suffix
+                        .strip_suffix('^')
+                        .unwrap_or(suffix)
+                        .trim_end_matches('.');
+                    if !valid_domain(domain) {
+                        return Err("unsupported AdGuard domain pattern".into());
                     }
-                    if is_allow {
+                    let domain = domain.to_ascii_lowercase();
+                    if let Some(options) = options {
+                        let rule = TypedRule::parse(line, is_allow, options)?;
+                        self.typed_suffixes.entry(domain).or_default().push(rule);
+                    } else if is_allow {
                         self.allow_suffixes.insert(domain);
                     } else {
                         self.block_suffixes.insert(domain);
                     }
+                } else if let Some(options) = options {
+                    return Err(
+                        format!("unsupported AdGuard modifier or pattern: {options}").into(),
+                    );
                 } else if pattern_part.starts_with('/') && pattern_part.ends_with('/') {
                     let pattern = pattern_part
                         .strip_prefix('/')
@@ -127,7 +138,8 @@ impl Blocklist {
 
         if line.starts_with("||")
             || line.starts_with("@@")
-            || (line.starts_with('/') && line.ends_with('/'))
+            || line.starts_with('/')
+            || (line.contains('$') && !line.contains('#') && !line.contains(char::is_whitespace))
         {
             self.parse_line_mode(line, ListFormat::AdBlock, as_allow)
         } else {
@@ -150,7 +162,10 @@ impl Blocklist {
             .error_for_status()?
             .text()
             .await?;
-        for line in content.lines() {
+        validate_content(&content)?;
+        let mut disabled = DisabledRules::default();
+        disabled.collect(content.lines(), false);
+        for line in content.lines().filter(|line| !disabled.skips(line, false)) {
             match format {
                 Some(f) => self.parse_line(line, f)?,
                 None => self.parse_auto(line)?,
@@ -213,7 +228,7 @@ impl Blocklist {
 
     fn clean_domain_static(domain: &str) -> Option<&str> {
         let cleaned = domain.trim_end_matches('.');
-        if cleaned.is_empty() {
+        if !valid_domain(cleaned) {
             return None;
         }
         // Never block local names commonly present in hosts files (e.g. the
@@ -237,6 +252,15 @@ impl Blocklist {
     /// Check a domain and return the outcome with the matched rule, if any.
     /// Only allocates the rule description string when a rule actually matches.
     pub fn check(&self, domain: &str) -> MatchOutcome {
+        self.check_name(domain, None)
+    }
+
+    /// Evaluate a DNS question or CNAME target using its wire record type.
+    pub fn check_query(&self, domain: &str, qtype: u16) -> MatchOutcome {
+        self.check_name(domain, Some(qtype))
+    }
+
+    fn check_name(&self, domain: &str, qtype: Option<u16>) -> MatchOutcome {
         // Fast path: query names are almost always already lowercase — borrow
         // the input as-is and only allocate when an uppercase byte is present.
         let lowered;
@@ -258,19 +282,112 @@ impl Blocklist {
         if let Some(hit) = Self::suffix_match(&self.allow_suffixes, domain_lower) {
             return MatchOutcome::Allowed(format!("allow_suffix:{hit}"));
         }
+        let mut typed_block = None;
+        let mut has_typed_allow = false;
+        if let Some(qtype) = qtype.filter(|_| !self.typed_suffixes.is_empty()) {
+            let suffixes = std::iter::successors(Some(domain_lower), |name| {
+                name.split_once('.').map(|(_, rest)| rest)
+            });
+            for rules in suffixes.filter_map(|suffix| self.typed_suffixes.get(suffix)) {
+                for rule in rules {
+                    has_typed_allow |= rule.allow;
+                    if !rule.matches(qtype) {
+                        continue;
+                    }
+                    if rule.allow {
+                        return MatchOutcome::Allowed(format!("allow:{}", rule.text));
+                    }
+                    typed_block.get_or_insert(rule);
+                }
+            }
+        }
+        // A name with an exception for another type cannot be reported as nonexistent.
+        let blocked = if has_typed_allow {
+            MatchOutcome::BlockedType
+        } else {
+            MatchOutcome::Blocked
+        };
         if self.block_domains.contains(domain_lower) {
-            return MatchOutcome::Blocked(format!("block:{}", domain_lower));
+            return blocked(format!("block:{}", domain_lower));
         }
         if let Some(hit) = Self::suffix_match(&self.block_suffixes, domain_lower) {
-            return MatchOutcome::Blocked(format!("block_suffix:{hit}"));
+            return blocked(format!("block_suffix:{hit}"));
         }
         for re in &self.block_regex {
             if re.is_match(domain_lower) {
-                return MatchOutcome::Blocked(format!("block_regex:{}", re.as_str()));
+                return blocked(format!("block_regex:{}", re.as_str()));
             }
         }
-        MatchOutcome::Forwarded
+        match typed_block {
+            Some(rule) => MatchOutcome::BlockedType(format!("block:{}", rule.text)),
+            None => MatchOutcome::Forwarded,
+        }
     }
+}
+
+fn valid_domain(name: &str) -> bool {
+    if name.contains('\\') {
+        // Wire names can contain decimal escapes, including literal dots inside a label.
+        return name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'\\'))
+            && crate::dns::serialize_name(name).is_ok();
+    }
+    !name.is_empty()
+        && name.len() <= 253
+        && name.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+        })
+}
+
+fn validate_content(body: &str) -> Result<(), &'static str> {
+    let first = body.trim_start_matches('\u{feff}').trim_start();
+    if first.is_empty() {
+        return Err("empty list body");
+    }
+    if first.starts_with('<') {
+        return Err("received markup instead of a filter list");
+    }
+    Ok(())
+}
+
+/// Probe only until the first usable rule in each configured format. The
+/// regular full parse still reports malformed lines with source locations.
+pub(crate) fn validate_list(body: &str, domains: bool, regex: bool) -> Result<(), String> {
+    validate_content(body)?;
+    if domains {
+        let mut probe = Blocklist::new();
+        let mut reason = None;
+        let usable = body.lines().enumerate().any(|(i, line)| {
+            let target = adguard::disabled_target(line);
+            match probe.parse_auto(target.as_deref().unwrap_or(line)) {
+                Ok(()) => probe.rule_count() > 0,
+                Err(error) => {
+                    reason.get_or_insert_with(|| format!("line {}: {error}", i + 1));
+                    false
+                }
+            }
+        });
+        if !usable {
+            return Err(reason.map_or_else(
+                || "no usable domain rules".into(),
+                |r| format!("no usable domain rules ({r})"),
+            ));
+        }
+    }
+    if regex
+        && !body
+            .lines()
+            .filter_map(regex_pattern)
+            .any(|pattern| !pattern.is_empty() && Regex::new(pattern).is_ok())
+    {
+        return Err("no usable regex rules".into());
+    }
+    Ok(())
 }
 
 /// Outcome of checking a domain against the blocklist.
@@ -278,6 +395,8 @@ impl Blocklist {
 pub enum MatchOutcome {
     /// Blocked by a block rule.
     Blocked(String),
+    /// A type-specific block returns NODATA, since other types may exist.
+    BlockedType(String),
     /// Allowed by an allow rule (overrides any block).
     Allowed(String),
     /// Not matched by any rule; forward to upstream.
@@ -287,19 +406,36 @@ pub enum MatchOutcome {
 }
 
 /// Parse ordinary list bodies, preserving source/line context for bad rules.
+#[allow(dead_code)] // Public single-feed API. The daemon compiles all feeds together.
 pub fn parse_lines_into(bl: &mut Blocklist, body: &str, source: &str) {
-    parse_domain_lines(bl, body, false, source);
+    parse_domain_feed(bl, body, false, source);
 }
 
+#[allow(dead_code)]
 pub fn parse_lines_into_allow(bl: &mut Blocklist, body: &str, source: &str) {
-    parse_domain_lines(bl, body, true, source);
+    parse_domain_feed(bl, body, true, source);
+}
+
+fn parse_domain_feed(bl: &mut Blocklist, body: &str, allow: bool, source: &str) {
+    let mut disabled = DisabledRules::default();
+    disabled.collect(body.lines(), allow);
+    parse_domain_lines(bl, body, allow, source, &disabled);
 }
 
 const MAX_RULE_WARNINGS: usize = 10;
 
-fn parse_domain_lines(bl: &mut Blocklist, body: &str, as_allow: bool, source: &str) {
+pub(crate) fn parse_domain_lines(
+    bl: &mut Blocklist,
+    body: &str,
+    as_allow: bool,
+    source: &str,
+    disabled: &DisabledRules,
+) {
     let mut skipped = 0;
     for (line_number, line) in body.lines().enumerate() {
+        if disabled.skips(line, as_allow) {
+            continue;
+        }
         if let Err(error) = bl.parse_auto_mode(line, as_allow) {
             skipped += 1;
             if skipped <= MAX_RULE_WARNINGS {
@@ -321,6 +457,19 @@ pub struct RegexParseCounts {
     pub skipped: usize,
 }
 
+fn regex_pattern(line: &str) -> Option<&str> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with(['#', '!']) || line.starts_with("--") {
+        return None;
+    }
+    let pattern = line.split(" -- ").next()?.trim();
+    if pattern.starts_with('/') && pattern.ends_with('/') {
+        Some(pattern.strip_prefix('/')?.strip_suffix('/').unwrap_or(""))
+    } else {
+        Some(pattern)
+    }
+}
+
 /// Compile one pattern per line, accepting Pi-hole comment trailers and /.../
 /// wrapping. Unsupported regexes are counted and reported, never broadened.
 pub fn parse_lines_into_regex(
@@ -331,26 +480,8 @@ pub fn parse_lines_into_regex(
 ) -> RegexParseCounts {
     let mut counts = RegexParseCounts::default();
     for (line_number, line) in body.lines().enumerate() {
-        let line = line.trim();
-        if line.is_empty()
-            || line.starts_with('#')
-            || line.starts_with('!')
-            || line.starts_with("--")
-        {
+        let Some(pattern) = regex_pattern(line) else {
             continue;
-        }
-        let pattern = line.split(" -- ").next().unwrap_or("").trim();
-        if pattern.is_empty() {
-            continue;
-        }
-        let wrapped = pattern.starts_with('/') && pattern.ends_with('/');
-        let pattern = if wrapped {
-            pattern
-                .strip_prefix('/')
-                .and_then(|s| s.strip_suffix('/'))
-                .unwrap_or("")
-        } else {
-            pattern
         };
         let compiled = if pattern.is_empty() {
             Err("empty regex delimiter".to_string())
@@ -398,6 +529,13 @@ pub fn merge_blocklist(target: &mut Blocklist, source: Blocklist) {
     target.block_suffixes.extend(source.block_suffixes);
     target.allow_regex.extend(source.allow_regex);
     target.block_regex.extend(source.block_regex);
+    for (domain, rules) in source.typed_suffixes {
+        target
+            .typed_suffixes
+            .entry(domain)
+            .or_default()
+            .extend(rules);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -418,6 +556,9 @@ pub struct CachedList {
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct CachedLists {
     pub map: HashMap<String, CachedList>,
+    /// A valid download whose disk write failed remains available to later refreshes.
+    #[serde(skip)]
+    unsaved: HashMap<String, Arc<String>>,
     #[serde(skip)]
     dirty: bool,
 }
@@ -600,8 +741,21 @@ async fn download_response(
     if resp.status() != reqwest::StatusCode::OK {
         return Err(format!("HTTP {}", resp.status()));
     }
+    if resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+        .is_some_and(|v| {
+            v.trim().eq_ignore_ascii_case("text/html")
+                || v.trim().eq_ignore_ascii_case("application/xhtml+xml")
+        })
+    {
+        return Err("received an HTML response for a filter list".into());
+    }
     let etag = resp_etag(&resp);
     let body = resp.text().await.map_err(|e| format!("read body: {e}"))?;
+    validate_content(&body)?;
     Ok(DownloadResult::Fresh { body, etag })
 }
 
@@ -652,6 +806,9 @@ impl CachedLists {
     pub fn cached_bodies(&self, urls: &[String], cache_path: &str) -> HashMap<String, String> {
         urls.iter()
             .filter_map(|url| {
+                if let Some(body) = self.unsaved.get(url) {
+                    return Some((url.clone(), body.as_ref().clone()));
+                }
                 let filename = self
                     .map
                     .get(url)
@@ -669,11 +826,16 @@ impl CachedLists {
         for (url, body) in self.cached_bodies(urls, old_path) {
             let filename = url_to_filename(&url);
             migrated.write_body(new_path, &filename, &body)?;
-            let mut entry = self.map.get(&url).cloned().unwrap_or(CachedList {
-                fetched_at: 0,
-                etag: None,
-                filename: filename.clone(),
-            });
+            let mut entry = self
+                .map
+                .get(&url)
+                .filter(|_| !self.unsaved.contains_key(&url))
+                .cloned()
+                .unwrap_or(CachedList {
+                    fetched_at: 0,
+                    etag: None,
+                    filename: filename.clone(),
+                });
             entry.filename = filename;
             migrated.map.insert(url, entry);
         }
@@ -728,7 +890,12 @@ impl CachedLists {
         let mut fresh = Vec::new();
         let mut jobs = Vec::new();
         for url in urls {
-            if let Some(body) = self.get_if_fresh(url, interval_secs, cache_path) {
+            if self.unsaved.contains_key(url) {
+                jobs.push(FetchJob {
+                    url: url.clone(),
+                    etag: None,
+                });
+            } else if let Some(body) = self.get_if_fresh(url, interval_secs, cache_path) {
                 fresh.push((url.clone(), body));
             } else {
                 jobs.push(FetchJob {
@@ -787,17 +954,41 @@ impl CachedLists {
     /// Phase 3 (sync — call under a brief lock): persist fresh downloads,
     /// refresh `fetched_at` on 304s, and return every usable (url, body),
     /// from disk or network. Logs failures.
+    #[allow(dead_code)] // Library callers can merge without the daemon's per-URL format config.
     pub fn merge_downloads(
         &mut self,
         results: Vec<(String, DownloadResult)>,
         cache_path: &str,
+    ) -> Vec<(String, String)> {
+        self.merge_validated(results, cache_path, |_, body| validate_content(body))
+    }
+
+    pub(crate) fn merge_validated<E: std::fmt::Display>(
+        &mut self,
+        results: Vec<(String, DownloadResult)>,
+        cache_path: &str,
+        validate: impl Fn(&str, &str) -> Result<(), E>,
     ) -> Vec<(String, String)> {
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let mut bodies = Vec::new();
-        for (url, res) in results {
+        for (url, mut res) in results {
+            if let DownloadResult::Fresh { body, .. } = &res {
+                if let Err(reason) = validate(&url, body) {
+                    res = DownloadResult::Failed(reason.to_string());
+                }
+            }
+            if !matches!(res, DownloadResult::Fresh { .. }) {
+                if let Some(body) = self.unsaved.get(&url) {
+                    log::warn!(
+                        "No valid replacement for {url}; retaining last usable in-memory copy"
+                    );
+                    bodies.push((url, body.as_ref().clone()));
+                    continue;
+                }
+            }
             match res {
                 DownloadResult::Fresh { body, etag } => {
                     let filename = url_to_filename(&url);
@@ -805,9 +996,11 @@ impl CachedLists {
                         log::error!("Failed to write cached body for {url}: {e}");
                         // Serve the valid download now; keep the metadata/ETag
                         // paired with the old disk body for the next retry.
+                        self.unsaved.insert(url.clone(), Arc::new(body.clone()));
                         bodies.push((url, body));
                         continue;
                     }
+                    self.unsaved.remove(&url);
                     self.map.insert(
                         url.clone(),
                         CachedList {
@@ -848,7 +1041,17 @@ impl CachedLists {
                     bodies.push((url, body));
                 }
                 DownloadResult::Failed(err) => {
-                    log::warn!("Fetch failed for {url}, no cached copy: {err}");
+                    let filename = self
+                        .map
+                        .get(&url)
+                        .map(|entry| entry.filename.clone())
+                        .unwrap_or_else(|| url_to_filename(&url));
+                    if let Some(body) = read_body_file(cache_path, &filename) {
+                        log::warn!("Fetch failed for {url}; using cached copy: {err}");
+                        bodies.push((url, body));
+                    } else {
+                        log::warn!("Fetch failed for {url}, no cached copy: {err}");
+                    }
                 }
             }
         }
@@ -859,6 +1062,7 @@ impl CachedLists {
     /// Also deletes the corresponding body files from disk.
     pub fn prune(&mut self, keep_urls: &[String], cache_path: &str) {
         let keep: HashSet<&str> = keep_urls.iter().map(|s| s.as_str()).collect();
+        self.unsaved.retain(|url, _| keep.contains(url.as_str()));
         let dir = bodies_dir(cache_path);
         let before = self.map.len();
         self.map.retain(|url, entry| {
@@ -1082,14 +1286,68 @@ mod tests {
     }
 
     #[test]
-    fn test_adblock_options_stripped() {
+    fn adguard_modifiers_never_broaden_a_rule() {
         let mut bl = Blocklist::new();
-        bl.parse_auto("||ads.example.co^$important").unwrap();
-        bl.parse_auto("||tracker.example.net^$third-party").unwrap();
-        assert!(bl.matches("ads.example.co"));
-        assert!(bl.matches("sub.ads.example.co"));
-        assert!(bl.matches("tracker.example.net"));
-        assert!(!bl.matches("example.com"));
+        for line in [
+            "||ads.test^$third-party",
+            "||ads.test^$important",
+            "@@||ads.test^$client=pc",
+            "||ads.test^$dnstype=A,client=pc",
+            "||ads.test^$dnstype=AAAA|typo",
+        ] {
+            assert!(bl.parse_auto(line).is_err(), "{line}");
+        }
+        assert_eq!(bl.check_query("ads.test", 28), MatchOutcome::Forwarded);
+        bl.parse_auto("||ads.test^$dnstype=~A|~cname").unwrap();
+        bl.parse_auto("@@||sub.ads.test^$dnstype=aaaa|HTTPS")
+            .unwrap();
+        assert_eq!(bl.check_query("sub.ads.test", 1), MatchOutcome::Forwarded);
+        assert!(matches!(
+            bl.check_query("ads.test", 28),
+            MatchOutcome::BlockedType(_)
+        ));
+        assert!(matches!(
+            bl.check_query("sub.ads.test", 28),
+            MatchOutcome::Allowed(_)
+        ));
+        assert!(matches!(
+            bl.check_query("sub.ads.test", 65),
+            MatchOutcome::Allowed(_)
+        ));
+        assert!(matches!(
+            bl.check_query("sub.ads.test", 16),
+            MatchOutcome::BlockedType(_)
+        ));
+    }
+
+    #[test]
+    fn badfilter_disables_only_its_matching_rule_in_any_order() {
+        let body = "||one.test^$badfilter\n||one.test^\n||two.test^$dnstype=A\n||two.test^$badfilter,dnstype=A\n||two.test^$dnstype=AAAA\n@@||other.test^\n@@||other.test^$badfilter\n||other.test^\n/^regex[.]test$/\n/^regex[.]test$/$badfilter";
+        let mut rules = Blocklist::new();
+        parse_lines_into(&mut rules, body, "list");
+        for name in ["one.test", "two.test", "regex.test"] {
+            assert_eq!(rules.check_query(name, 1), MatchOutcome::Forwarded);
+        }
+        assert!(matches!(
+            rules.check_query("two.test", 28),
+            MatchOutcome::BlockedType(_)
+        ));
+        assert!(rules.matches("other.test"));
+    }
+
+    #[test]
+    fn unconditional_block_with_typed_exception_returns_nodata_for_other_types() {
+        let mut rules = Blocklist::new();
+        rules.parse_auto("||example.test^").unwrap();
+        rules.parse_auto("@@||example.test^$dnstype=A").unwrap();
+        assert!(matches!(
+            rules.check_query("example.test", 1),
+            MatchOutcome::Allowed(_)
+        ));
+        assert!(matches!(
+            rules.check_query("example.test", 28),
+            MatchOutcome::BlockedType(_)
+        ));
     }
 
     #[test]

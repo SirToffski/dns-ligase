@@ -392,6 +392,48 @@ async fn stale_cached_rules_apply_before_remote_refresh_finishes() {
 }
 
 #[tokio::test]
+async fn unusable_200_keeps_cached_rules_and_metadata_across_restart() {
+    let upstream = dns(false).await;
+    let bad = http_body(None, "# feed temporarily unavailable\n").await;
+    let good = http_body(None, "working.test\n||disabled.test^\n").await;
+    let overrides = http_body(None, "||disabled.test^$badfilter\n").await;
+    let mut app = App::new(upstream.port);
+    app.urls = vec![bad.url.clone(), good.url.clone(), overrides.url.clone()];
+    let path = app.cache_path.to_str().unwrap();
+    let mut cache = CachedLists::new();
+    cache.merge_downloads(
+        vec![(
+            bad.url.clone(),
+            DownloadResult::Fresh {
+                body: "cached.test\n".into(),
+                etag: Some("\"last-good\"".into()),
+            },
+        )],
+        path,
+    );
+    cache.save_to_disk(path).unwrap();
+    let fetched_at = cache.map[&bad.url].fetched_at;
+    for _ in 0..2 {
+        app.start();
+        app.wait_log("Initial remote refresh completed.").await;
+        assert_eq!(rcode(&app.udp("cached.test").await.unwrap()), 3);
+        assert_eq!(rcode(&app.udp("working.test").await.unwrap()), 3);
+        assert_eq!(rcode(&app.udp("disabled.test").await.unwrap()), 0);
+        app.stop().await;
+        let disk = CachedLists::load_from_disk(app.cache_path.to_str().unwrap()).unwrap();
+        assert_eq!(disk.map[&bad.url].etag.as_deref(), Some("\"last-good\""));
+        assert_eq!(disk.map[&bad.url].fetched_at, fetched_at);
+        assert_eq!(
+            disk.cached_bodies(
+                std::slice::from_ref(&bad.url),
+                app.cache_path.to_str().unwrap()
+            )[&bad.url],
+            "cached.test\n"
+        );
+    }
+}
+
+#[tokio::test]
 async fn hup_queued_during_old_refresh_cannot_be_overwritten_by_it() {
     let upstream = dns(false).await;
     let list = http(Some(2)).await;

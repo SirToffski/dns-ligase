@@ -294,6 +294,32 @@ fn persistence_failure_keeps_download_and_old_metadata() {
     );
     assert_eq!(bodies, [(url.into(), "new.example\n".into())]);
     assert_eq!(cache.map[url].etag.as_deref(), Some("old"));
+    let rejected = cache.merge_downloads(
+        vec![(
+            url.into(),
+            DownloadResult::Fresh {
+                body: String::new(),
+                etag: Some("empty".into()),
+            },
+        )],
+        path.to_str().unwrap(),
+    );
+    assert_eq!(rejected, bodies);
+    assert_eq!(cache.map[url].etag.as_deref(), Some("old"));
+}
+
+#[test]
+fn validate_candidates_in_each_configured_list_format() {
+    for body in ["", " \n", "! comment\n", "<!DOCTYPE html>\n<p>error</p>"] {
+        assert!(validate_list(body, true, false).is_err());
+        assert!(validate_list(body, false, true).is_err());
+    }
+    assert!(validate_list("||host.test^$client=phone", true, false).is_err());
+    assert!(validate_list("unsupported rule text\n", true, false).is_err());
+    assert!(validate_list("[invalid\n(?=unsupported)", false, true).is_err());
+    assert!(validate_list("[invalid\n^ads[.]", false, true).is_ok());
+    assert!(validate_list("||host.test^$badfilter", true, false).is_ok());
+    assert!(validate_list("bad rule text\n127.0.0.1 real.test", true, false).is_ok());
 }
 
 #[test]
