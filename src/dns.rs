@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::convert::TryInto;
 use std::io::{self, Cursor, Read};
 use std::net::Ipv4Addr;
@@ -301,7 +302,7 @@ impl DnsMessage {
         ))
     }
 
-    /// Construct a packet. Use `query_with_edns` to modify existing wire data:
+    /// Construct a packet. Use `query_with_udp_size` to modify existing wire data:
     /// opaque RDATA in parsed records can contain packet-relative pointers.
     pub fn serialize(&self) -> io::Result<Vec<u8>> {
         let mut header = self.header.clone();
@@ -358,37 +359,20 @@ impl DnsMessage {
     }
 }
 
-/// Patch the OPT metadata found by parse_wire, leaving existing packet
-/// offsets intact. Opaque RDATA and all EDNS options retain their exact bytes.
-pub(crate) fn query_with_edns(
+/// Adjust an existing OPT's payload size without changing DO, options, or packet offsets.
+pub(crate) fn query_with_udp_size(
     data: &[u8],
     opt_offset: Option<usize>,
     buffer_size: u16,
-) -> io::Result<Vec<u8>> {
-    let mut wire = data.to_vec();
+) -> Cow<'_, [u8]> {
+    let mut wire = Cow::Borrowed(data);
     if let Some(offset) = opt_offset {
-        wire[offset + 2..offset + 4].copy_from_slice(&buffer_size.to_be_bytes());
-        let ttl = u32::from_be_bytes(wire[offset + 4..offset + 8].try_into().unwrap()) | EDNS_DO;
-        wire[offset + 4..offset + 8].copy_from_slice(&ttl.to_be_bytes());
-    } else {
-        if data.len() + 11 > MAX_DNS_MESSAGE {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "No room for OPT record",
-            ));
+        let size = offset + 2..offset + 4;
+        if data[size.clone()] != buffer_size.to_be_bytes() {
+            wire.to_mut()[size].copy_from_slice(&buffer_size.to_be_bytes());
         }
-        let count = u16::from_be_bytes([wire[10], wire[11]])
-            .checked_add(1)
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "Too many additional records")
-            })?;
-        wire[10..12].copy_from_slice(&count.to_be_bytes());
-        wire.extend_from_slice(&[0, 0, 41]);
-        wire.extend_from_slice(&buffer_size.to_be_bytes());
-        wire.extend_from_slice(&EDNS_DO.to_be_bytes());
-        wire.extend_from_slice(&[0, 0]);
     }
-    Ok(wire)
+    wire
 }
 
 /// A reversible presentation name: separators are dots; dots, backslashes

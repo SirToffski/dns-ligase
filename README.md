@@ -28,7 +28,7 @@ client → UDP/TCP listener → parse DNS wire format → extract QNAME
 | --- | --- |
 | `dns.rs` | Hand-rolled DNS wire format: header, question, resource record, message. Reversible byte escapes for names, compression-pointer and length checks, EDNS0/OPT handling. |
 | `blocklist.rs` | Rule storage and matching. List fetching with an on-disk cache, conditional GETs, and format parsing. |
-| `upstream.rs` | Upstream connection pool (UDP + TCP, shared across queries), UDP and TCP listeners, blocklist check, NXDOMAIN construction, DO-bit injection, forwarding, truncation/TCP fallback, timeouts, query logging. |
+| `upstream.rs` | Upstream connection pool (UDP + TCP, shared across queries), UDP and TCP listeners, filtering, local DNS error replies, forwarding, truncation/TCP fallback, timeouts, query logging. |
 | `journald.rs` | Minimal journald native protocol sender for structured query logs (no external crate). |
 | `stats.rs` | `stats` subcommand: reads journald JSON, filters by action/domain/source/time, prints table or summary. |
 | `clients.rs` | Per-client policy: unfiltered sources and source-scoped allow rules, with IP/CIDR matching. |
@@ -89,8 +89,9 @@ Startup loads manual rules and all readable cached bodies, including stale ones,
 - Standard single-question DNS queries; ambiguous multi-question requests and non-query messages are rejected before filtering
 - Hand-written wire format parser and serializer
 - Name compression pointers with bounds checks and a jump limit
-- Names retain literal dots, backslashes and arbitrary label bytes using decimal escapes internally; only actual label boundaries become dots. Reserved label types and overlong names are rejected. Forwarded queries retain their original wire layout, so adding/updating OPT does not relocate compression pointers in opaque RDATA.
-- EDNS0: advertises a 1232-byte buffer, sets the DO bit on outgoing queries even when the client didn't, passes RRSIG/NSEC and the AD flag through untouched
+- Names retain literal dots, backslashes and arbitrary label bytes using decimal escapes internally; only actual label boundaries become dots. Reserved label types and overlong names are rejected. Forwarded queries retain their original wire layout and compression pointers.
+- Plain DNS queries stay plain. For EDNS queries, the forwarder advertises a 1232-byte UDP buffer to Unbound and preserves the client's DO bit and options. Locally generated EDNS replies carry a minimal OPT record with the client's DO bit.
+- An upstream timeout or failed exchange returns `SERVFAIL` with the original query ID and question. TCP clients can send their next query on the same connection.
 - Truncation handling: if an upstream UDP response comes back with TC set, the query is retried over TCP. A response exceeding the client's UDP path is reduced to a TC reply with the question and OPT when they fit. Oversized OPT options are dropped. The client limit is its advertised size, with a 512-byte minimum and the IPv4 UDP payload ceiling; without OPT it is 512 bytes.
 - Upstream connection reuse: a bounded pool of connected UDP and TCP sockets to the upstream, shared across queries; timed-out or errored sockets are discarded rather than returned, so a late stray response can never leak into a later query; a dead pooled TCP connection is retried once on a fresh one
 - Replies on both transports must match ID, response bit, opcode and all question names/types/classes. Stale replies are skipped within the deadline; sockets that see stale or malformed replies are discarded. UDP TC replies may have partial answer sections, but must carry the complete matching question before TCP fallback.
@@ -291,8 +292,11 @@ dig @127.0.0.1 -p 5354 google.com
 # DNSSEC pass-through: expect the ad flag and RRSIG records
 dig @127.0.0.1 -p 5354 cloudflare.com +dnssec
 
-# DO bit injection: no +dnssec from the client, but RRSIGs should still appear
-dig @127.0.0.1 -p 5354 cloudflare.com
+# Request the A records alone
+dig @127.0.0.1 -p 5354 cloudflare.com A +nodnssec
+
+# Compare a plain DNS reply with Unbound using the same +noedns option
+dig @127.0.0.1 -p 5354 cloudflare.com A +noedns
 
 # DNSSEC validation failure: expect SERVFAIL through proxy and unbound
 dig @127.0.0.1 -p 5354 dnssec-failed.org

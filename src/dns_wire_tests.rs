@@ -12,23 +12,16 @@ fn literal_opt_wire_uses_low_flags_bit_and_preserves_options() {
     let (msg, offset) = DnsMessage::parse_wire(&wire).unwrap();
     assert!(msg.edns_do);
     assert_eq!(msg.additionals[0].ttl, 0x0000_8000);
-    let patched = query_with_edns(&wire, offset, 1232).unwrap();
-    let mut expected = wire;
+    let patched = query_with_udp_size(&wire, offset, 1232);
+    let mut expected = wire.clone();
     expected[QUERY.len() + 3..QUERY.len() + 5].copy_from_slice(&[0x04, 0xd0]);
     assert_eq!(patched, expected);
 }
 
 #[test]
-fn injected_opt_has_known_wire_bytes() {
+fn legacy_query_is_forwarded_without_an_opt() {
     let (_, offset) = DnsMessage::parse_wire(QUERY).unwrap();
-    let patched = query_with_edns(QUERY, offset, 1232).unwrap();
-    let mut expected = QUERY.to_vec();
-    expected[11] = 1;
-    expected.extend_from_slice(b"\0\0\x29\x04\xd0\0\0\x80\0\0\0");
-    assert_eq!(patched, expected);
-    let parsed = DnsMessage::parse(&patched).unwrap();
-    assert!(parsed.edns_do);
-    assert_eq!(parsed.additionals[0].ttl >> 24, 0);
+    assert_eq!(query_with_udp_size(QUERY, offset, 1232).as_ref(), QUERY);
 }
 
 #[test]
@@ -42,7 +35,9 @@ fn extended_rcode_high_bit_is_not_do() {
 #[test]
 fn raw_rewrite_keeps_packet_relative_rdata_pointers() {
     let mut wire = QUERY.to_vec();
-    wire[11] = 2;
+    wire[11] = 3;
+    // Place OPT before the other records so relocating it would break their pointers.
+    wire.extend_from_slice(b"\0\0\x29\x10\0\0\0\0\0\0\0");
     // An NS record's RDATA introduces an uncompressed target name.
     wire.extend_from_slice(b"\xc0\x0c\0\x02\0\x01\0\0\0\x3c\0\x10");
     let target_offset = wire.len();
@@ -51,19 +46,19 @@ fn raw_rewrite_keeps_packet_relative_rdata_pointers() {
     wire.extend_from_slice(&(0xc000 | target_offset as u16).to_be_bytes());
     let (before, offset) = DnsMessage::parse_wire(&wire).unwrap();
     assert_eq!(
-        before.additionals[1].cname_target.as_deref(),
+        before.additionals[2].cname_target.as_deref(),
         Some("target.example")
     );
-    let patched = query_with_edns(&wire, offset, 1232).unwrap();
-    let mut prefix = wire;
-    prefix[11] = 3;
-    assert_eq!(&patched[..prefix.len()], &prefix);
+    let patched = query_with_udp_size(&wire, offset, 1232);
+    let mut expected = wire.clone();
+    expected[QUERY.len() + 3..QUERY.len() + 5].copy_from_slice(&1232u16.to_be_bytes());
+    assert_eq!(patched, expected);
     let after = DnsMessage::parse(&patched).unwrap();
     assert_eq!(
-        after.additionals[1].cname_target,
-        before.additionals[1].cname_target
+        after.additionals[2].cname_target,
+        before.additionals[2].cname_target
     );
-    assert_eq!(after.additionals[0].rdata, before.additionals[0].rdata);
+    assert_eq!(after.additionals[1].rdata, before.additionals[1].rdata);
 }
 
 #[test]

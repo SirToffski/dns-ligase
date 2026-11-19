@@ -10,7 +10,9 @@ use tokio::time::{timeout, timeout_at, Duration, Instant};
 
 use crate::blocklist::{Blocklist, MatchOutcome};
 use crate::clients::ClientPolicy;
-use crate::dns::{query_with_edns, DnsHeader, DnsMessage, DnsQuestion, MAX_DNS_MESSAGE};
+use crate::dns::{
+    query_with_udp_size, DnsHeader, DnsMessage, DnsQuestion, EDNS_DO, MAX_DNS_MESSAGE,
+};
 use crate::journald;
 
 #[cfg(test)]
@@ -28,9 +30,12 @@ mod policy_tests;
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(2);
 /// EDNS0 UDP payload size we advertise to upstream. 1232 is the DNS flag day
 /// value: large enough to carry typical responses while staying under the common path MTU to avoid
-/// IP fragmentation. We advertise this fixed size regardless of what the client
-/// asked for; the client's own limit is honored separately via truncation.
+/// IP fragmentation. Only EDNS queries advertise this size. The client's
+/// receive limit is honored separately via truncation.
 const EDNS_BUFFER_SIZE: usize = 1232;
+const SERVFAIL: u16 = 2;
+const NXDOMAIN: u16 = 3;
+const BADVERS: u16 = 16;
 const MAX_UDP_PAYLOAD: usize = 65_507;
 /// How long to wait for a client to send the next query on an idle TCP
 /// connection (RFC 7766 idle timeout). A clean EOF or expiry here closes the
@@ -162,10 +167,7 @@ impl Upstream {
         let id = INTERNAL_QUERY_ID.fetch_add(1, Ordering::Relaxed);
         let query = DnsMessage::new_query(id, host, 1);
         let wire = query.serialize()?;
-        let mut resp_bytes = self.udp_query(&wire).await?;
-        if tc_bit_set(&resp_bytes) {
-            resp_bytes = self.tcp_query(&wire).await?;
-        }
+        let resp_bytes = self.udp_query_with_fallback(&wire).await?;
         if tc_bit_set(&resp_bytes) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -174,6 +176,15 @@ impl Upstream {
         }
         let resp = DnsMessage::parse(&resp_bytes)?;
         Ok(resp.a_records())
+    }
+
+    async fn udp_query_with_fallback(&self, query: &[u8]) -> io::Result<Vec<u8>> {
+        let response = self.udp_query(query).await?;
+        if tc_bit_set(&response) {
+            self.tcp_query(query).await
+        } else {
+            Ok(response)
+        }
     }
 
     /// One overall deadline covers checkout, send, stale replies and return.
@@ -347,22 +358,29 @@ async fn process_query(
     if matches!(outcome, MatchOutcome::Blocked(_)) {
         log::info!("Blocking domain: {}", question.name);
         return Ok(QueryResult {
-            wire: build_nxdomain(&msg)?,
+            wire: build_error_response(msg, NXDOMAIN)?,
             question,
             outcome,
         });
     }
-    let outgoing = query_with_edns(packet, opt_offset, EDNS_BUFFER_SIZE as u16)?;
-    let mut wire = match transport {
-        ClientTransport::Udp => {
-            let response = state.upstream.udp_query(&outgoing).await?;
-            if tc_bit_set(&response) {
-                state.upstream.tcp_query(&outgoing).await?
-            } else {
-                response
-            }
+    let outgoing = query_with_udp_size(packet, opt_offset, EDNS_BUFFER_SIZE as u16);
+    let response = match transport {
+        ClientTransport::Udp => state.upstream.udp_query_with_fallback(&outgoing).await,
+        ClientTransport::Tcp => state.upstream.tcp_query(&outgoing).await,
+    };
+    let mut wire = match response {
+        Ok(wire) => wire,
+        Err(error) => {
+            log::error!(
+                "DNS exchange with {} failed: {error}",
+                state.upstream.addr()
+            );
+            return Ok(QueryResult {
+                wire: build_error_response(msg, SERVFAIL)?,
+                question,
+                outcome,
+            });
         }
-        ClientTransport::Tcp => state.upstream.tcp_query(&outgoing).await?,
     };
     // An actual allow rule for the requested name (or a bypassed client)
     // exempts this entire query from filtering. It does not allow the target
@@ -377,7 +395,7 @@ async fn process_query(
             if let MatchOutcome::Blocked(rule) = state.blocklist.check(target) {
                 log::info!("Blocking CNAME target {target} for {}", question.name);
                 return Ok(QueryResult {
-                    wire: build_nxdomain(&msg)?,
+                    wire: build_error_response(msg, NXDOMAIN)?,
                     question,
                     outcome: MatchOutcome::Blocked(format!("cname:{target} {rule}")),
                 });
@@ -603,18 +621,22 @@ fn qtype_str(qtype: u16) -> &'static str {
     }
 }
 
-/// Build an NXDOMAIN response for a blocked query, preserving the question.
-fn build_nxdomain(msg: &DnsMessage) -> io::Result<Vec<u8>> {
-    let mut response_msg = msg.clone();
-    response_msg.header.flags = (msg.header.flags & 0x7910) | 0x8083; // opcode/RD/CD, QR|RA|NXDOMAIN
-    response_msg.header.qdcount = 1;
-    response_msg.header.ancount = 0;
-    response_msg.header.nscount = 0;
-    // arcount is set by serialize() from additionals.len(), not the header field.
-    response_msg.answers.clear();
-    response_msg.authorities.clear();
-    response_msg.additionals.clear();
-    response_msg.serialize()
+/// Answer a validated question locally. An EDNS client gets a minimal OPT
+/// advertising our own size and version, with its DO bit and no echoed options.
+fn build_error_response(mut msg: DnsMessage, mut rcode: u16) -> io::Result<Vec<u8>> {
+    msg.answers.clear();
+    msg.authorities.clear();
+    msg.additionals.retain(|rr| rr.rtype == 41);
+    if let Some(opt) = msg.additionals.first_mut() {
+        if opt.ttl & 0x00ff_0000 != 0 {
+            rcode = BADVERS;
+        }
+        opt.rclass = EDNS_BUFFER_SIZE as u16;
+        opt.ttl = (u32::from(rcode >> 4) << 24) | (opt.ttl & EDNS_DO);
+        opt.rdata.clear();
+    }
+    msg.header.flags = (msg.header.flags & 0x7910) | 0x8080 | (rcode & 0xf); // opcode/RD/CD, QR|RA
+    msg.serialize()
 }
 
 /// Write a DNS message to a TCP stream with the 2-byte length prefix.

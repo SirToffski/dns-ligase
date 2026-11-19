@@ -40,17 +40,45 @@ fn truncated_response_drops_oversized_options_and_preserves_extended_rcode() {
 fn blocked_response_preserves_question_bytes_and_request_flags() {
     let mut query = DnsMessage::new_query(1234, r"a\046b.\255.test", 28);
     query.header.flags = 0x0010; // CD, no RD
-    let parsed = DnsMessage::parse(&build_nxdomain(&query).unwrap()).unwrap();
+    let parsed =
+        DnsMessage::parse(&build_error_response(query.clone(), NXDOMAIN).unwrap()).unwrap();
     assert_eq!(parsed.header.flags, 0x8093);
+    assert_eq!(parsed.header.id, 1234);
+    assert!(parsed.additionals.is_empty());
     assert_eq!(parsed.questions, query.questions);
     assert_eq!(parsed.header.qdcount, 1);
 }
 
+#[test]
+fn local_errors_negotiate_edns_and_clear_request_options() {
+    for (request_ttl, expected_ttl, expected_rcode) in [
+        (0x0040, 0, NXDOMAIN),
+        (EDNS_DO, EDNS_DO, NXDOMAIN),
+        (0x0001_8000, 0x0100_8000, 0), // BADVERS, EDNS version zero
+    ] {
+        let mut query = DnsMessage::new_query(7, "blocked.test", 1);
+        query.add_opt_record(4096).unwrap();
+        query.additionals[0].ttl = request_ttl;
+        query.additionals[0].rdata = vec![0, 12, 0, 2, 0, 0]; // padding
+        let wire = build_error_response(query, NXDOMAIN).unwrap();
+        let parsed = DnsMessage::parse(&wire).unwrap();
+        assert_eq!(parsed.header.flags & 0xf, expected_rcode);
+        assert_eq!(parsed.additionals.len(), 1);
+        let opt = &parsed.additionals[0];
+        assert_eq!(opt.rclass, 1232);
+        assert_eq!(opt.ttl, expected_ttl);
+        assert!(opt.rdata.is_empty());
+    }
+}
+
 fn answer(query: &[u8], truncated: bool) -> Vec<u8> {
     let mut msg = DnsMessage::parse(query).unwrap();
-    assert!(msg.edns_do);
-    assert_eq!(msg.additionals[0].ttl & 0xff00_0000, 0);
-    assert_eq!(msg.additionals[0].rclass, 1232);
+    if msg.questions[0].name == "fallback.test" {
+        assert!(msg.additionals.is_empty());
+    } else {
+        assert!(msg.edns_do);
+        assert_eq!(msg.additionals[0].rclass, 1232);
+    }
     msg.header.flags = if truncated { 0x8380 } else { 0x8180 };
     if !truncated {
         // Three well-formed TXT character strings, making the reply >512 B.
@@ -69,6 +97,26 @@ fn answer(query: &[u8], truncated: bool) -> Vec<u8> {
         });
     }
     msg.serialize().unwrap()
+}
+
+async fn start_forwarder(upstream_addr: SocketAddr) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let state = Arc::new(RwLock::new(Arc::new(QueryState {
+        upstream: Arc::new(Upstream::new(upstream_addr)),
+        blocklist: Arc::default(),
+        clients: Arc::default(),
+        log_queries: false,
+    })));
+    let forwarder = UdpForwarder::new("127.0.0.1:0", state).await.unwrap();
+    let listen = forwarder.udp_socket.local_addr().unwrap();
+    let task = tokio::spawn(async move { forwarder.run().await.unwrap() });
+    (listen, task)
+}
+
+async fn read_tcp_frame(stream: &mut TcpStream) -> Vec<u8> {
+    let len = stream.read_u16().await.unwrap();
+    let mut wire = vec![0; usize::from(len)];
+    stream.read_exact(&mut wire).await.unwrap();
+    wire
 }
 
 #[tokio::test]
@@ -111,17 +159,7 @@ async fn udp_size_normalization_and_tcp_fallback_work_end_to_end() {
             });
         }
     });
-    let state = Arc::new(RwLock::new(Arc::new(QueryState {
-        upstream: Arc::new(Upstream::new(addr)),
-        blocklist: Arc::new(Blocklist::new()),
-        clients: Arc::default(),
-        log_queries: false,
-    })));
-    let forwarder = UdpForwarder::new("127.0.0.1:0", state).await.unwrap();
-    let listen = forwarder.udp_socket.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        forwarder.run().await.unwrap();
-    });
+    let (listen, server) = start_forwarder(addr).await;
     let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     for (size, should_truncate) in [(0, true), (128, true), (8192, false)] {
         let mut query = DnsMessage::new_query(0x1234, "large.test", 16);
@@ -153,22 +191,111 @@ async fn udp_size_normalization_and_tcp_fallback_work_end_to_end() {
         .unwrap();
     assert!(tc_bit_set(&buf[..n]));
     assert!(n <= 512);
+    assert!(DnsMessage::parse(&buf[..n]).unwrap().additionals.is_empty());
     let mut stream = TcpStream::connect(listen).await.unwrap();
-    let mut frame = (query.len() as u16).to_be_bytes().to_vec();
-    frame.extend(query);
-    stream.write_all(&frame).await.unwrap();
-    let n = timeout(Duration::from_secs(2), stream.read_u16())
+    write_tcp_message(&mut stream, &query).await.unwrap();
+    let reply = timeout(Duration::from_secs(2), read_tcp_frame(&mut stream))
         .await
-        .unwrap()
         .unwrap();
-    let mut reply = vec![0; n as usize];
-    stream.read_exact(&mut reply).await.unwrap();
     assert!(!tc_bit_set(&reply));
     assert_eq!(DnsMessage::parse(&reply).unwrap().answers.len(), 1);
     assert_eq!(tcp_queries.load(Ordering::SeqCst), 2);
     server.abort();
     udp_task.abort();
     tcp_task.abort();
+}
+
+#[tokio::test]
+async fn udp_timeout_and_failed_tcp_fallback_return_servfail() {
+    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = tcp.local_addr().unwrap();
+    let udp = UdpSocket::bind(addr).await.unwrap();
+    let upstream = tokio::spawn(async move {
+        let mut buf = [0; 512];
+        udp.recv_from(&mut buf).await.unwrap(); // first request times out
+        let (n, peer) = udp.recv_from(&mut buf).await.unwrap();
+        let mut truncated = DnsMessage::parse(&buf[..n]).unwrap();
+        truncated.header.flags = 0x8380;
+        udp.send_to(&truncated.serialize().unwrap(), peer)
+            .await
+            .unwrap();
+        let (mut stream, _) = tcp.accept().await.unwrap();
+        read_tcp_frame(&mut stream).await; // close without answering the retry
+    });
+    let (listen, server) = start_forwarder(addr).await;
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    for id in [11, 12] {
+        let mut query = DnsMessage::new_query(id, "unavailable.test", 28);
+        if id == 12 {
+            query.add_opt_record(4096).unwrap();
+            query.additionals[0].ttl = 0; // EDNS without DO
+        }
+        client
+            .send_to(&query.serialize().unwrap(), listen)
+            .await
+            .unwrap();
+        let mut buf = [0; 512];
+        let n = timeout(Duration::from_secs(5), client.recv(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let response = DnsMessage::parse(&buf[..n]).unwrap();
+        assert_eq!(response.header.flags, 0x8182);
+        assert_eq!(response.header.id, id);
+        assert_eq!(response.questions, query.questions);
+        assert_eq!(response.additionals.len(), query.additionals.len());
+        assert!(!response.edns_do);
+    }
+    timeout(Duration::from_secs(5), upstream)
+        .await
+        .unwrap()
+        .unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+async fn tcp_client_can_query_again_after_upstream_failure() {
+    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (listen, server) = start_forwarder(tcp.local_addr().unwrap()).await;
+    let upstream = tokio::spawn(async move {
+        let (mut first, _) = tcp.accept().await.unwrap();
+        read_tcp_frame(&mut first).await;
+        drop(first);
+        let (mut next, _) = tcp.accept().await.unwrap();
+        let mut reply = DnsMessage::parse(&read_tcp_frame(&mut next).await).unwrap();
+        reply.header.flags = 0x8180;
+        write_tcp_message(&mut next, &reply.serialize().unwrap())
+            .await
+            .unwrap();
+    });
+    let mut stream = TcpStream::connect(listen).await.unwrap();
+    for (id, flags) in [(21, 0x8192), (22, 0x8180)] {
+        let mut query = DnsMessage::new_query(id, "recovery.test", 1);
+        query.add_opt_record(4096).unwrap();
+        if id == 21 {
+            query.header.flags |= 0x0010; // CD must survive local SERVFAIL
+        } else {
+            query.additionals[0].ttl = 0;
+        }
+        write_tcp_message(&mut stream, &query.serialize().unwrap())
+            .await
+            .unwrap();
+        let wire = timeout(Duration::from_secs(5), read_tcp_frame(&mut stream))
+            .await
+            .unwrap();
+        let response = DnsMessage::parse(&wire).unwrap();
+        assert_eq!(response.header.id, id);
+        assert_eq!(response.header.flags, flags);
+        assert_eq!(response.questions, query.questions);
+        assert_eq!(response.additionals.len(), 1);
+        assert_eq!(response.additionals[0].rclass, 1232);
+        assert_eq!(response.additionals[0].ttl, query.additionals[0].ttl);
+    }
+    timeout(Duration::from_secs(5), upstream)
+        .await
+        .unwrap()
+        .unwrap();
+    server.abort();
 }
 
 #[test]
